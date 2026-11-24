@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Monochrome particle orb status bar glyph -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,4A8,8 0 1,1 4,12A8,8 0 0,1 12,4M12,6A6,6 0 1,0 18,12A6,6 0 0,0 12,6Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,8.5A3.5,3.5 0 1,1 8.5,12A3.5,3.5 0 0,1 12,8.5Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5.2,6.2A1.2,1.2 0 1,1 4,7.4A1.2,1.2 0 0,1 5.2,6.2Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M18.8,16.6A1.2,1.2 0 1,1 17.6,17.8A1.2,1.2 0 0,1 18.8,16.6Z" />
+</vector>

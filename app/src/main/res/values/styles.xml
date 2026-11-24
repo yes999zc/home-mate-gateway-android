@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.HomeMateDark" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/hm_bg_root</item>
+        <item name="android:colorBackground">@color/hm_bg_root</item>
+        <item name="android:statusBarColor">@color/hm_bg_root</item>
+        <item name="android:navigationBarColor">@color/hm_bg_root</item>
+        <item name="android:colorPrimary">@color/hm_accent_primary</item>
+        <item name="android:colorAccent">@color/hm_accent_primary</item>
+        <item name="android:textColorPrimary">@color/hm_text_primary</item>
+        <item name="android:textColorSecondary">@color/hm_text_secondary</item>
+    </style>
+
+    <color name="hm_bg_root">#09090B</color>
+    <color name="hm_accent_primary">#FAFAFA</color>
+    <color name="hm_text_primary">#FAFAFA</color>
+    <color name="hm_text_secondary">#A1A1AA</color>
+</resources>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Home Mate</string>
+    <string name="service_notification_title">Home Mate 语音与中控网关</string>
+    <string name="service_notification_text">正在连接 Home Mate Core...</string>
+</resources>

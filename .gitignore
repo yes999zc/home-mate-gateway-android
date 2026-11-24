@@ -1,0 +1,18 @@
+# Build outputs
+build/
+.gradle/
+local.properties
+*.apk
+*.aab
+*.dex
+*.class
+*.keystore
+*.jks
+*.idsig
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+__pycache__/
+*.pyc
