@@ -19,11 +19,12 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
+import homes.mymate.gateway.protocol.MediaPlaybackBufferPolicy;
 import homes.mymate.gateway.protocol.NorthboundSession;
+import homes.mymate.gateway.protocol.PlaybackStreamDriver;
 import homes.mymate.gateway.protocol.SoftwareAecFilter;
 
 /**
@@ -50,14 +51,19 @@ public final class AudioEngine {
     public static final int BLOCK_BYTES = BLOCK_SAMPLES * 2;
     private static final int STREAM_QUEUE_CAPACITY = 512;
     private static final long CANCEL_TOMBSTONE_TTL_MS = 30_000L;
+    private static final long INIT_RETRY_MIN_BACKOFF_MS = 500L;
+    private static final long INIT_RETRY_MAX_BACKOFF_MS = 5_000L;
 
     public interface CaptureCallback {
-        void onAudioBlockCaptured(byte[] pcm16leBytes, double rmsDbfs, double noiseFloorDbfs, double snrDb, boolean aecActive);
+        void onAudioBlockCaptured(byte[] pcm16leBytes, byte[] kwsPcm16leBytes, double rmsDbfs, double noiseFloorDbfs, double snrDb, boolean aecActive);
         void onPlaybackFirstChunk(String taskId);
         void onPlaybackReferenceChunk(byte[] pcm16leBytes, double effectiveLinearGain, long nowMs);
         void onPlaybackActiveChanged(boolean anyActive);
         void onPlaybackSuperseded(String supersededTaskId);
-        void onPlaybackFinished(String taskId, long playedMs);
+        void onPlaybackFinished(String taskId, long playedMs, String progressBasis);
+        void onPlaybackFailed(String taskId, String detail);
+        void onAudioFocusGained();
+        void onAudioFocusLostMedia(List<String> stoppedTaskIds, List<NorthboundSession.StopPlaybackResult> stopResults);
         void onAudioError(String stage, String message);
     }
 
@@ -66,50 +72,70 @@ public final class AudioEngine {
         void onLiveAudioEnergy(double rmsDbfs, double bassDbfs, boolean isMusic);
     }
 
-    private static final byte[] END_OF_STREAM_SENTINEL = new byte[0];
-
     private static final class StreamSession {
-        final String taskId;
-        final String channel;
-        final boolean isMedia;
-        final int sampleRate;
-        final int channels;
+        final PlaybackStreamDriver.StreamState state;
         final AudioTrack track;
-        final Object trackLock = new Object();
-        final ArrayBlockingQueue<byte[]> chunkQueue = new ArrayBlockingQueue<byte[]>(STREAM_QUEUE_CAPACITY);
-        volatile Thread writerThread;
-        volatile long pcmBytesWritten = 0;
         volatile float currentTrackGain = 1.0f;
-        volatile boolean cancelled = false;
-        boolean released = false;
-        long lastRawHead = 0L;
-        long headWrapOffset = 0L;
 
-        StreamSession(String taskId, String channel, boolean isMedia, int sampleRate, int channels, AudioTrack track) {
-            this.taskId = taskId;
-            this.channel = channel;
-            this.isMedia = isMedia;
-            this.sampleRate = sampleRate > 0 ? sampleRate : SAMPLE_RATE_HZ;
-            this.channels = channels >= 2 ? 2 : 1;
+        StreamSession(PlaybackStreamDriver.StreamState state, AudioTrack track) {
+            this.state = state;
             this.track = track;
         }
+    }
 
-        /** Must be called while holding {@code trackLock} and when {@code !released}. */
-        long readUnwrappedHeadFramesLocked() {
-            long raw = track.getPlaybackHeadPosition() & 0xFFFFFFFFL;
-            if (raw < lastRawHead && (lastRawHead - raw) > 0x80000000L) {
-                headWrapOffset += 0x100000000L;
+    private static PlaybackStreamDriver.TrackHandle wrapAudioTrack(final AudioTrack track) {
+        return new PlaybackStreamDriver.TrackHandle() {
+            @Override
+            public void play() {
+                track.play();
             }
-            lastRawHead = raw;
-            return headWrapOffset + raw;
-        }
+
+            @Override
+            public void pause() {
+                track.pause();
+            }
+
+            @Override
+            public void flush() {
+                track.flush();
+            }
+
+            @Override
+            public void stop() {
+                track.stop();
+            }
+
+            @Override
+            public void release() {
+                track.release();
+            }
+
+            @Override
+            public int getPlaybackHeadPosition() {
+                return track.getPlaybackHeadPosition();
+            }
+
+            @Override
+            public int write(byte[] data, int offset, int length) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    return track.write(data, offset, length, AudioTrack.WRITE_NON_BLOCKING);
+                }
+                return track.write(data, offset, length);
+            }
+        };
     }
 
     private final Context context;
     private final CaptureCallback callback;
     private final SoftwareAecFilter softwareAec = new SoftwareAecFilter();
+    // Dedicated KWS-only PBFDAF echo suppressor active during BOTH voice (TTS) and media (music)
+    // playback so mid-playback wake/retreat barge-in works cleanly without altering raw uplink PCM.
+    private final SoftwareAecFilter kwsPlaybackAec = new SoftwareAecFilter();
+    private volatile long lastPlaybackWriteWallMs = 0L;
 
     private volatile boolean running = false;
+    private volatile boolean stopRequested = false;
+    private volatile boolean waitingForInitRetry = false;
     private volatile boolean useVoiceCommSource = true;
     private volatile boolean softwareAecEnabled = false;
     private volatile float uplinkGain = 1.0f;
@@ -141,6 +167,7 @@ public final class AudioEngine {
                     || focusChange == AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK) {
                 focusDucked = false;
                 updateMediaDucking();
+                callback.onAudioFocusGained();
             } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
                 focusDucked = false;
                 stopMediaStreamsOnly();
@@ -164,9 +191,14 @@ public final class AudioEngine {
 
     public void configure(boolean useVoiceCommSource, boolean softwareAecEnabled, float uplinkGain) {
         boolean sourceChanged = (this.useVoiceCommSource != useVoiceCommSource);
+        boolean swAecChanged = (this.softwareAecEnabled != softwareAecEnabled);
         this.useVoiceCommSource = useVoiceCommSource;
         this.softwareAecEnabled = softwareAecEnabled;
         this.softwareAec.setEnabled(softwareAecEnabled);
+        if (swAecChanged || sourceChanged) {
+            this.softwareAec.reset();
+            this.kwsPlaybackAec.reset();
+        }
         this.uplinkGain = Math.max(0.5f, Math.min(6.0f, uplinkGain));
         if (sourceChanged && running) {
             stopCapture();
@@ -176,13 +208,23 @@ public final class AudioEngine {
 
     public boolean isHardwareAecEnabled() { return hardwareAecEnabled; }
     public boolean isSoftwareAecEnabled() { return softwareAecEnabled; }
-    public double getSoftwareAecErleDb() { return softwareAec.getLastErleDb(); }
+    public double getSoftwareAecErleDb() {
+        return softwareAecEnabled ? softwareAec.getLastErleDb() : kwsPlaybackAec.getLastErleDb();
+    }
+    public double getKwsPlaybackAecErleDb() { return kwsPlaybackAec.getLastErleDb(); }
+    public SoftwareAecFilter.AecTelemetry getActiveAecTelemetry() {
+        return softwareAecEnabled ? softwareAec.getTelemetrySnapshot() : kwsPlaybackAec.getTelemetrySnapshot();
+    }
     public boolean isHardwareNsEnabled() { return hardwareNsEnabled; }
     public double getNoiseFloorDbfs() { return noiseFloorDbfs; }
 
+    public boolean hasActiveAnyPlayback() {
+        return hasActiveVoicePlayback() || hasActiveMediaPlayback();
+    }
+
     public boolean hasActiveMediaPlayback() {
         for (StreamSession s : activeStreams.values()) {
-            if (!s.cancelled && s.isMedia) {
+            if (!s.state.cancelled && s.state.isMedia) {
                 return true;
             }
         }
@@ -191,7 +233,7 @@ public final class AudioEngine {
 
     public boolean hasActiveVoicePlayback() {
         for (StreamSession s : activeStreams.values()) {
-            if (!s.cancelled && !s.isMedia) {
+            if (!s.state.cancelled && !s.state.isMedia) {
                 return true;
             }
         }
@@ -221,9 +263,10 @@ public final class AudioEngine {
     }
 
     public synchronized void startCapture() {
-        if (running) {
+        if (running && !stopRequested && captureThread != null && captureThread.isAlive()) {
             return;
         }
+        stopRequested = false;
         running = true;
         captureThread = new Thread(new Runnable() {
             @Override
@@ -235,7 +278,36 @@ public final class AudioEngine {
         captureThread.start();
     }
 
+    /**
+     * Recovers microphone capture after transient AudioRecord contention, focus loss, or late
+     * permission grant without interrupting an already-recording capture session.
+     */
+    public synchronized void ensureCaptureRunning() {
+        if (stopRequested) {
+            return;
+        }
+        if (!running || captureThread == null || !captureThread.isAlive()) {
+            startCapture();
+        } else if (waitingForInitRetry) {
+            captureThread.interrupt();
+        }
+    }
+
+    public synchronized boolean isCaptureRunning() {
+        return running && !stopRequested && captureThread != null && captureThread.isAlive();
+    }
+
+    /**
+     * Cleanly tears down any existing {@code AudioRecord} (such as one silenced during Android 11-14
+     * boot-restricted FGS) and creates a fresh recorder on a new capture thread (P1-4).
+     */
+    public synchronized void restartCapture() {
+        stopCapture();
+        startCapture();
+    }
+
     public synchronized void stopCapture() {
+        stopRequested = true;
         running = false;
         AudioRecord rec = activeRecorderForUnblock;
         if (rec != null) {
@@ -266,17 +338,25 @@ public final class AudioEngine {
             minBuf = BLOCK_BYTES * 4;
         }
         int bufferSize = Math.max(minBuf * 2, BLOCK_BYTES * 4);
+        long initBackoffMs = INIT_RETRY_MIN_BACKOFF_MS;
 
-        while (running && !Thread.currentThread().isInterrupted()) {
+        while (running && !stopRequested) {
+            if (Thread.currentThread().isInterrupted()) {
+                if (stopRequested || !running) {
+                    break;
+                }
+                Thread.interrupted();
+            }
             AudioRecord localRecord = null;
             AcousticEchoCanceler localAec = null;
             NoiseSuppressor localNs = null;
             AutomaticGainControl localAgc = null;
+            boolean shouldRetryBackoff = false;
 
             try {
                 int audioSource = useVoiceCommSource
                         ? MediaRecorder.AudioSource.VOICE_COMMUNICATION
-                        : MediaRecorder.AudioSource.MIC;
+                        : MediaRecorder.AudioSource.VOICE_RECOGNITION;
 
                 localRecord = new AudioRecord(
                         audioSource,
@@ -285,8 +365,9 @@ public final class AudioEngine {
                         AudioFormat.ENCODING_PCM_16BIT,
                         bufferSize);
 
-                if (localRecord.getState() != AudioRecord.STATE_INITIALIZED && useVoiceCommSource) {
+                if (localRecord.getState() != AudioRecord.STATE_INITIALIZED) {
                     localRecord.release();
+                    localRecord = null;
                     localRecord = new AudioRecord(
                             MediaRecorder.AudioSource.MIC,
                             SAMPLE_RATE_HZ,
@@ -296,123 +377,139 @@ public final class AudioEngine {
                 }
 
                 if (localRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-                    callback.onAudioError("init", "AudioRecord initialization failed (check RECORD_AUDIO permission)");
-                    running = false;
-                    return;
-                }
-
-                activeRecorderForUnblock = localRecord;
-                int sessionId = localRecord.getAudioSessionId();
-                hardwareAecEnabled = false;
-                hardwareNsEnabled = false;
-                try {
-                    if (AcousticEchoCanceler.isAvailable()) {
-                        localAec = AcousticEchoCanceler.create(sessionId);
-                        if (localAec != null) {
-                            localAec.setEnabled(true);
-                            hardwareAecEnabled = localAec.getEnabled();
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-                try {
-                    if (NoiseSuppressor.isAvailable()) {
-                        localNs = NoiseSuppressor.create(sessionId);
-                        if (localNs != null) {
-                            localNs.setEnabled(true);
-                            hardwareNsEnabled = localNs.getEnabled();
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-                try {
-                    if (AutomaticGainControl.isAvailable()) {
-                        localAgc = AutomaticGainControl.create(sessionId);
-                        if (localAgc != null) {
-                            // Explicitly disable AGC so quiet room noise floors are not amplified into false ASR turns
-                            localAgc.setEnabled(false);
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-
-                localRecord.startRecording();
-
-                byte[] readBuffer = new byte[BLOCK_BYTES];
-                int consecutiveReadErrors = 0;
-                final int halfBlock = BLOCK_BYTES / 2;
-
-                while (running && !Thread.currentThread().isInterrupted()) {
-                    int offset = 0;
-                    boolean halfEmitted = false;
-                    boolean readFailed = false;
-                    while (offset < BLOCK_BYTES && running) {
-                        int targetChunk = (!halfEmitted && offset < halfBlock)
-                                ? (halfBlock - offset)
-                                : (BLOCK_BYTES - offset);
-                        int r = localRecord.read(readBuffer, offset, targetChunk);
-                        if (r > 0) {
-                            offset += r;
-                            consecutiveReadErrors = 0;
-                            if (!halfEmitted && offset >= halfBlock) {
-                                halfEmitted = true;
-                                EnergyListener el = energyListener;
-                                if (el != null && !hasActiveMediaPlayback()) {
-                                    double rms = computeSubBlockRmsDbfs(readBuffer, 0, halfBlock);
-                                    el.onLiveAudioEnergy(rms, rms, false);
+                    callback.onAudioError("init",
+                            "AudioRecord initialization failed (retrying in " + initBackoffMs + "ms)");
+                    shouldRetryBackoff = true;
+                } else {
+                    activeRecorderForUnblock = localRecord;
+                    int sessionId = localRecord.getAudioSessionId();
+                    hardwareAecEnabled = false;
+                    hardwareNsEnabled = false;
+                    if (useVoiceCommSource) {
+                        try {
+                            if (AcousticEchoCanceler.isAvailable()) {
+                                localAec = AcousticEchoCanceler.create(sessionId);
+                                if (localAec != null) {
+                                    localAec.setEnabled(true);
+                                    hardwareAecEnabled = localAec.getEnabled();
                                 }
                             }
-                        } else {
-                            readFailed = true;
-                            consecutiveReadErrors++;
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    // Keep platform NoiseSuppressor OFF: OEM telephony NS aggressively attenuates far-field
+                    // and noisy-room voice and clips wake-word onset consonants before local KWS runs.
+                    try {
+                        if (NoiseSuppressor.isAvailable()) {
+                            localNs = NoiseSuppressor.create(sessionId);
+                            if (localNs != null) {
+                                localNs.setEnabled(false);
+                                hardwareNsEnabled = localNs.getEnabled();
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    try {
+                        if (AutomaticGainControl.isAvailable()) {
+                            localAgc = AutomaticGainControl.create(sessionId);
+                            if (localAgc != null) {
+                                // Explicitly disable AGC so quiet room noise floors are not amplified into false ASR turns
+                                localAgc.setEnabled(false);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+
+                    localRecord.startRecording();
+                    initBackoffMs = INIT_RETRY_MIN_BACKOFF_MS;
+
+                    byte[] readBuffer = new byte[BLOCK_BYTES];
+                    int consecutiveReadErrors = 0;
+                    final int halfBlock = BLOCK_BYTES / 2;
+
+                    while (running && !stopRequested && !Thread.currentThread().isInterrupted()) {
+                        int offset = 0;
+                        boolean halfEmitted = false;
+                        boolean readFailed = false;
+                        while (offset < BLOCK_BYTES && running && !stopRequested) {
+                            int targetChunk = (!halfEmitted && offset < halfBlock)
+                                    ? (halfBlock - offset)
+                                    : (BLOCK_BYTES - offset);
+                            int r = localRecord.read(readBuffer, offset, targetChunk);
+                            if (r > 0) {
+                                offset += r;
+                                consecutiveReadErrors = 0;
+                                if (!halfEmitted && offset >= halfBlock) {
+                                    halfEmitted = true;
+                                    EnergyListener el = energyListener;
+                                    if (el != null && !hasActiveMediaPlayback()) {
+                                        double rms = computeSubBlockRmsDbfs(readBuffer, 0, halfBlock);
+                                        el.onLiveAudioEnergy(rms, rms, false);
+                                    }
+                                }
+                            } else {
+                                readFailed = true;
+                                consecutiveReadErrors++;
+                                break;
+                            }
+                        }
+                        if (!running || stopRequested) {
                             break;
                         }
-                    }
-                    if (!running) {
-                        break;
-                    }
-                    if (readFailed || offset < BLOCK_BYTES) {
-                        if (consecutiveReadErrors >= 8) {
-                            callback.onAudioError("read_recover", "AudioRecord read stalled; re-initializing");
-                            break; // Re-initialize recorder cleanly
+                        if (readFailed || offset < BLOCK_BYTES) {
+                            if (consecutiveReadErrors >= 8) {
+                                callback.onAudioError("read_recover", "AudioRecord read stalled; re-initializing");
+                                shouldRetryBackoff = true;
+                                break; // Re-initialize recorder cleanly with bounded backoff
+                            }
+                            try {
+                                Thread.sleep(20L);
+                            } catch (InterruptedException ie) {
+                                break;
+                            }
+                            continue;
                         }
-                        try {
-                            Thread.sleep(20L);
-                        } catch (InterruptedException ie) {
-                            break;
+
+                        byte[] block = new byte[BLOCK_BYTES];
+                        System.arraycopy(readBuffer, 0, block, 0, BLOCK_BYTES);
+
+                        long captureNowMs = System.currentTimeMillis();
+                        if (softwareAecEnabled) {
+                            block = softwareAec.processCaptureBlock(block, captureNowMs);
                         }
-                        continue;
+
+                        if (Math.abs(uplinkGain - 1.0f) > 0.02f) {
+                            applyPcmGainInPlace(block, uplinkGain);
+                        }
+
+                        long lastPlayWrite = lastPlaybackWriteWallMs;
+                        boolean kwsAecNeeded = !softwareAecEnabled
+                                && (hasActiveMediaPlayback()
+                                    || hasActiveVoicePlayback()
+                                    || (lastPlayWrite > 0L && (captureNowMs - lastPlayWrite) <= 400L));
+                        byte[] kwsBlock = kwsAecNeeded
+                                ? kwsPlaybackAec.processCaptureBlock(block, captureNowMs)
+                                : block;
+
+                        double rmsDbfs = NorthboundSession.computeRmsDbfs(block);
+                        if (rmsDbfs < noiseFloorDbfs) {
+                            noiseFloorDbfs = 0.85 * noiseFloorDbfs + 0.15 * rmsDbfs;
+                        } else if (rmsDbfs < noiseFloorDbfs + 6.0) {
+                            noiseFloorDbfs = 0.995 * noiseFloorDbfs + 0.005 * rmsDbfs;
+                        }
+                        noiseFloorDbfs = Math.max(-85.0, Math.min(-30.0, noiseFloorDbfs));
+                        double snrDb = Math.max(0.0, rmsDbfs - noiseFloorDbfs);
+
+                        EnergyListener el = energyListener;
+                        if (el != null && !hasActiveMediaPlayback()) {
+                            // Second 40ms half-block completes genuine 25Hz (40ms cadence) orb voice reactivity
+                            double halfRms = computeSubBlockRmsDbfs(block, halfBlock, halfBlock);
+                            el.onLiveAudioEnergy(halfRms, halfRms, false);
+                        }
+
+                        callback.onAudioBlockCaptured(block, kwsBlock, rmsDbfs, noiseFloorDbfs, snrDb,
+                                hardwareAecEnabled || softwareAecEnabled);
                     }
-
-                    byte[] block = new byte[BLOCK_BYTES];
-                    System.arraycopy(readBuffer, 0, block, 0, BLOCK_BYTES);
-
-                    if (softwareAecEnabled) {
-                        block = softwareAec.processCaptureBlock(block, System.currentTimeMillis());
-                    }
-
-                    if (Math.abs(uplinkGain - 1.0f) > 0.02f) {
-                        applyPcmGainInPlace(block, uplinkGain);
-                    }
-
-                    double rmsDbfs = NorthboundSession.computeRmsDbfs(block);
-                    if (rmsDbfs < noiseFloorDbfs) {
-                        noiseFloorDbfs = 0.85 * noiseFloorDbfs + 0.15 * rmsDbfs;
-                    } else if (rmsDbfs < noiseFloorDbfs + 6.0) {
-                        noiseFloorDbfs = 0.995 * noiseFloorDbfs + 0.005 * rmsDbfs;
-                    }
-                    noiseFloorDbfs = Math.max(-85.0, Math.min(-30.0, noiseFloorDbfs));
-                    double snrDb = Math.max(0.0, rmsDbfs - noiseFloorDbfs);
-
-                    EnergyListener el = energyListener;
-                    if (el != null && !hasActiveMediaPlayback()) {
-                        // Second 40ms half-block completes genuine 25Hz (40ms cadence) orb voice reactivity
-                        double halfRms = computeSubBlockRmsDbfs(block, halfBlock, halfBlock);
-                        el.onLiveAudioEnergy(halfRms, halfRms, false);
-                    }
-
-                    callback.onAudioBlockCaptured(block, rmsDbfs, noiseFloorDbfs, snrDb,
-                            hardwareAecEnabled || softwareAecEnabled);
                 }
             } catch (SecurityException se) {
                 callback.onAudioError("permission", "RECORD_AUDIO permission not granted: " + se.getMessage());
@@ -420,11 +517,7 @@ public final class AudioEngine {
                 return;
             } catch (Throwable t) {
                 callback.onAudioError("capture", "Capture error: " + t.getMessage());
-                try {
-                    Thread.sleep(500L);
-                } catch (InterruptedException ignored) {
-                    break;
-                }
+                shouldRetryBackoff = true;
             } finally {
                 activeRecorderForUnblock = null;
                 releaseEffectSafely(localAec);
@@ -441,6 +534,24 @@ public final class AudioEngine {
                         localRecord.release();
                     } catch (Throwable ignored) {
                     }
+                }
+            }
+
+            if (shouldRetryBackoff && running && !stopRequested) {
+                long sleepMs = initBackoffMs;
+                initBackoffMs = Math.min(INIT_RETRY_MAX_BACKOFF_MS, initBackoffMs * 2L);
+                waitingForInitRetry = true;
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException ignored) {
+                    if (stopRequested || !running) {
+                        break;
+                    }
+                    // Woken early by ensureCaptureRunning() (e.g. AUDIOFOCUS_GAIN / Activity resume)
+                    Thread.interrupted();
+                    initBackoffMs = INIT_RETRY_MIN_BACKOFF_MS;
+                } finally {
+                    waitingForInitRetry = false;
                 }
             }
         }
@@ -512,7 +623,7 @@ public final class AudioEngine {
 
     public void playWav(final String taskId, final String channel, final byte[] wavBytes) {
         if (wavBytes == null || wavBytes.length == 0) {
-            callback.onPlaybackFinished(taskId, 0L);
+            callback.onPlaybackFinished(taskId, 0L, "written");
             return;
         }
         final int sampleRate = NorthboundSession.parseWavSampleRate(wavBytes, SAMPLE_RATE_HZ);
@@ -537,13 +648,11 @@ public final class AudioEngine {
         // Preempt any existing stream on the same normalized channel class and report superseded
         for (Map.Entry<String, StreamSession> entry : activeStreams.entrySet()) {
             StreamSession existing = entry.getValue();
-            if (existing != null && existing.isMedia == isMedia && !taskId.equals(existing.taskId)) {
-                stopStream(existing.taskId);
-                callback.onPlaybackSuperseded(existing.taskId);
+            if (existing != null && existing.state.isMedia == isMedia && !taskId.equals(existing.state.taskId)) {
+                stopStream(existing.state.taskId);
+                callback.onPlaybackSuperseded(existing.state.taskId);
             }
         }
-
-        requestPlaybackAudioFocus(isMedia);
 
         int rate = sampleRate > 0 ? sampleRate : SAMPLE_RATE_HZ;
         int numCh = channels >= 2 ? 2 : 1;
@@ -554,9 +663,7 @@ public final class AudioEngine {
             minBuf = Math.max(4096, (rate * frameBytes) / 10);
         }
 
-        int desiredBytes = isMedia ? Math.max(minBuf * 2, (rate * frameBytes) / 3)
-                : Math.max(minBuf, (rate * frameBytes) / 10);
-        int bufSize = ((desiredBytes + frameBytes - 1) / frameBytes) * frameBytes;
+        int bufSize = MediaPlaybackBufferPolicy.computeAudioTrackBufferBytes(isMedia, rate, numCh, minBuf);
 
         AudioAttributes attrs = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -582,8 +689,12 @@ public final class AudioEngine {
                         attrs, fmt, bufSize, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE);
             }
         } catch (Throwable t) {
-            callback.onAudioError("playback_init", "AudioTrack create failed: " + t.getMessage());
-            callback.onPlaybackFinished(taskId, 0L);
+            updateMediaDucking();
+            updateFocusAfterStreamChange();
+            callback.onPlaybackActiveChanged(hasActiveVoicePlayback() || hasActiveMediaPlayback());
+            String err = "AudioTrack create failed: " + t.getMessage();
+            callback.onAudioError("playback_init", err);
+            callback.onPlaybackFailed(taskId, err);
             return;
         }
 
@@ -592,26 +703,46 @@ public final class AudioEngine {
                 track.release();
             } catch (Throwable ignored) {
             }
-            callback.onAudioError("playback_init", "AudioTrack uninitialized for " + rate + "Hz/" + numCh + "ch");
-            callback.onPlaybackFinished(taskId, 0L);
+            updateMediaDucking();
+            updateFocusAfterStreamChange();
+            callback.onPlaybackActiveChanged(hasActiveVoicePlayback() || hasActiveMediaPlayback());
+            String err = "AudioTrack uninitialized for " + rate + "Hz/" + numCh + "ch";
+            callback.onAudioError("playback_init", err);
+            callback.onPlaybackFailed(taskId, err);
             return;
         }
 
-        final StreamSession session = new StreamSession(taskId, chName, isMedia, rate, numCh, track);
-        activeStreams.put(taskId, session);
+        // Register session BEFORE requesting AudioFocus under focusLock so a concurrently
+        // finishing stream's updateFocusAfterStreamChange() can never abandon the new focus.
+        final PlaybackStreamDriver.StreamState streamState = new PlaybackStreamDriver.StreamState(
+                taskId, chName, isMedia, rate, numCh, STREAM_QUEUE_CAPACITY, wrapAudioTrack(track));
+        final StreamSession session = new StreamSession(streamState, track);
+        synchronized (focusLock) {
+            activeStreams.put(taskId, session);
+            requestPlaybackAudioFocus(isMedia);
+        }
         updateMediaDucking();
         callback.onPlaybackActiveChanged(true);
 
-        synchronized (session.trackLock) {
-            if (!session.released) {
-                try {
-                    track.play();
-                } catch (Throwable t) {
-                    activeStreams.remove(taskId, session);
-                    releaseSessionTrackSafely(session, true);
-                    callback.onAudioError("playback_play", "AudioTrack.play failed: " + t.getMessage());
-                    callback.onPlaybackFinished(taskId, 0L);
-                    return;
+        // Voice streams start immediately for ultra-low TTS latency; media streams defer
+        // track.play() until PlaybackStreamDriver.runWriterLoop() finishes memory pre-buffering.
+        if (!isMedia) {
+            synchronized (session.state.trackLock) {
+                if (!session.state.released) {
+                    try {
+                        track.play();
+                        session.state.trackStarted = true;
+                    } catch (Throwable t) {
+                        activeStreams.remove(taskId, session);
+                        PlaybackStreamDriver.releaseTrackSafely(session.state, true);
+                        updateMediaDucking();
+                        updateFocusAfterStreamChange();
+                        callback.onPlaybackActiveChanged(hasActiveVoicePlayback() || hasActiveMediaPlayback());
+                        String err = "AudioTrack.play failed: " + t.getMessage();
+                        callback.onAudioError("playback_play", err);
+                        callback.onPlaybackFailed(taskId, err);
+                        return;
+                    }
                 }
             }
         }
@@ -624,7 +755,7 @@ public final class AudioEngine {
         }, "hm-play-" + chName + "-" + taskId);
         wt.setPriority(Thread.NORM_PRIORITY + 1);
         wt.setDaemon(true);
-        session.writerThread = wt;
+        session.state.writerThread = wt;
         wt.start();
     }
 
@@ -633,13 +764,13 @@ public final class AudioEngine {
             return;
         }
         final StreamSession session = activeStreams.get(taskId);
-        if (session == null || session.cancelled) {
+        if (session == null || session.state.cancelled) {
             return;
         }
-        if (!session.chunkQueue.offer(pcmBytes)) {
+        if (!session.state.chunkQueue.offer(pcmBytes)) {
             // Bounded backpressure: wait briefly rather than silent OOM or hard drop
             try {
-                session.chunkQueue.offer(pcmBytes, 250L, TimeUnit.MILLISECONDS);
+                session.state.chunkQueue.offer(pcmBytes, 250L, TimeUnit.MILLISECONDS);
             } catch (InterruptedException ignored) {
             }
         }
@@ -650,147 +781,105 @@ public final class AudioEngine {
             return;
         }
         final StreamSession session = activeStreams.get(taskId);
-        if (session == null || session.cancelled) {
+        if (session == null || session.state.cancelled) {
             return;
         }
-        if (!session.chunkQueue.offer(END_OF_STREAM_SENTINEL)) {
+        // Always mark EOS unconditionally so a full chunkQueue can never wedge
+        // runStreamWriterLoop(), AudioTrack, AudioFocus, or play_finished.
+        session.state.eosReceived = true;
+        if (!session.state.chunkQueue.offer(PlaybackStreamDriver.StreamState.END_OF_STREAM_SENTINEL)) {
             try {
-                session.chunkQueue.offer(END_OF_STREAM_SENTINEL, 250L, TimeUnit.MILLISECONDS);
+                session.state.chunkQueue.offer(
+                        PlaybackStreamDriver.StreamState.END_OF_STREAM_SENTINEL, 250L, TimeUnit.MILLISECONDS);
             } catch (InterruptedException ignored) {
             }
         }
     }
 
     private void runStreamWriterLoop(final StreamSession session) {
-        boolean reachedEos = false;
-        boolean firstChunkSent = false;
-        long lastRefFeedMs = 0L;
+        final PlaybackStreamDriver.StreamState st = session.state;
+        final long[] lastRefFeedMs = new long[]{0L};
+        PlaybackStreamDriver.RunResult result = null;
         try {
-            while (!session.cancelled && !Thread.currentThread().isInterrupted()) {
-                byte[] chunk = session.chunkQueue.poll(150, TimeUnit.MILLISECONDS);
-                if (chunk == null) {
-                    continue;
-                }
-                if (chunk == END_OF_STREAM_SENTINEL) {
-                    reachedEos = true;
-                    break;
-                }
-
-                long nowMs = System.currentTimeMillis();
-                if (softwareAecEnabled) {
-                    softwareAec.pushPlaybackReference(chunk, session.sampleRate, session.channels, nowMs);
-                }
-                double effGain = getCurrentHardwareVolumeLinear() * session.currentTrackGain;
-                callback.onPlaybackReferenceChunk(chunk, effGain, nowMs);
-
-                if (nowMs - lastRefFeedMs >= 28L) {
-                    lastRefFeedMs = nowMs;
-                    EnergyListener el = energyListener;
-                    if (el != null) {
-                        if (session.isMedia) {
-                            // Real-time stereo music full-band + low-pass bass energy (~35Hz) for orb rhythm
-                            double fullRms = NorthboundSession.computeRmsDbfs(chunk);
-                            double bassRms = computeLowPassBassRmsDbfs(chunk, session.channels);
-                            el.onLiveAudioEnergy(fullRms, bassRms, true);
-                        } else {
-                            double ttsRms = NorthboundSession.computeRmsDbfs(chunk);
-                            el.onLiveAudioEnergy(ttsRms, ttsRms, false);
+            result = PlaybackStreamDriver.runWriterLoop(st, new PlaybackStreamDriver.WriterCallbacks() {
+                @Override
+                public void onBeforeWriteChunk(byte[] chunk, long nowMs) {
+                    if (nowMs - lastRefFeedMs[0] >= 28L) {
+                        lastRefFeedMs[0] = nowMs;
+                        EnergyListener el = energyListener;
+                        if (el != null) {
+                            if (st.isMedia) {
+                                // Real-time stereo music full-band + low-pass bass energy (~35Hz) for orb rhythm
+                                double fullRms = NorthboundSession.computeRmsDbfs(chunk);
+                                double bassRms = computeLowPassBassRmsDbfs(chunk, st.channels);
+                                el.onLiveAudioEnergy(fullRms, bassRms, true);
+                            } else {
+                                double ttsRms = NorthboundSession.computeRmsDbfs(chunk);
+                                el.onLiveAudioEnergy(ttsRms, ttsRms, false);
+                            }
                         }
                     }
                 }
 
-                int offset = 0;
-                while (offset < chunk.length && !session.cancelled) {
-                    int written;
-                    synchronized (session.trackLock) {
-                        if (session.released || session.cancelled) {
-                            break;
-                        }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            written = session.track.write(
-                                    chunk, offset, chunk.length - offset, AudioTrack.WRITE_NON_BLOCKING);
-                        } else {
-                            written = session.track.write(chunk, offset, chunk.length - offset);
-                        }
-                    }
-                    if (written > 0) {
-                        offset += written;
-                        session.pcmBytesWritten += written;
-                        if (!firstChunkSent) {
-                            firstChunkSent = true;
-                            callback.onPlaybackFirstChunk(session.taskId);
-                        }
-                    } else if (written == 0) {
-                        Thread.sleep(8L);
+                @Override
+                public void onPcmWritten(byte[] chunk, int writeStart, int written, long writeNowMs) {
+                    lastPlaybackWriteWallMs = writeNowMs;
+                    int aecChannel = st.isMedia
+                            ? SoftwareAecFilter.CHANNEL_MEDIA
+                            : SoftwareAecFilter.CHANNEL_VOICE;
+                    float trackGain = session.currentTrackGain;
+                    int queuedTrackMs = st.lastQueuedTrackMs;
+                    if (softwareAecEnabled) {
+                        softwareAec.pushPlaybackReference(
+                                aecChannel, chunk, writeStart, written,
+                                st.sampleRate, st.channels, trackGain, writeNowMs, queuedTrackMs);
                     } else {
-                        callback.onAudioError("playback_write", "AudioTrack.write returned " + written);
-                        session.cancelled = true;
-                        break;
+                        kwsPlaybackAec.pushPlaybackReference(
+                                aecChannel, chunk, writeStart, written,
+                                st.sampleRate, st.channels, trackGain, writeNowMs, queuedTrackMs);
                     }
-                }
-            }
-
-            if (reachedEos && !session.cancelled) {
-                final long totalFrames = session.pcmBytesWritten / (2L * session.channels);
-                // Signal MODE_STREAM AudioTrack to drain all buffered frames cleanly
-                long headFrames = 0L;
-                synchronized (session.trackLock) {
-                    if (!session.released && !session.cancelled) {
-                        try {
-                            headFrames = session.readUnwrappedHeadFramesLocked();
-                            session.track.stop();
-                        } catch (Throwable ignored) {
-                        }
-                    }
+                    double effGain = getCurrentHardwareVolumeLinear() * session.currentTrackGain;
+                    byte[] refSlice = (writeStart == 0 && written == chunk.length)
+                            ? chunk
+                            : java.util.Arrays.copyOfRange(chunk, writeStart, writeStart + written);
+                    callback.onPlaybackReferenceChunk(refSlice, effGain, writeNowMs);
                 }
 
-                long remainingFrames = Math.max(0L, totalFrames - headFrames);
-                long remainingMs = (remainingFrames * 1000L) / Math.max(1, session.sampleRate);
-                long deadline = System.currentTimeMillis() + Math.min(15_000L, Math.max(150L, remainingMs + 350L));
-                long lastHead = headFrames;
-                long lastAdvanceMs = System.currentTimeMillis();
-
-                while (!session.cancelled && System.currentTimeMillis() < deadline) {
-                    long curHead;
-                    synchronized (session.trackLock) {
-                        if (session.released) {
-                            break;
-                        }
-                        try {
-                            curHead = session.readUnwrappedHeadFramesLocked();
-                        } catch (Throwable ignored) {
-                            break;
-                        }
-                    }
-                    if (totalFrames > 0 && curHead >= totalFrames) {
-                        break;
-                    }
-                    long now = System.currentTimeMillis();
-                    if (curHead > lastHead) {
-                        lastHead = curHead;
-                        lastAdvanceMs = now;
-                    } else if (now - lastAdvanceMs > 1200L) {
-                        break; // HAL head stalled after drain
-                    }
-                    Thread.sleep(20L);
+                @Override
+                public void onFirstChunkWritten() {
+                    callback.onPlaybackFirstChunk(st.taskId);
                 }
-            }
-        } catch (InterruptedException ignored) {
+
+                @Override
+                public void onAudioError(String stage, String message) {
+                    callback.onAudioError(stage, message);
+                }
+            });
         } finally {
-            boolean wasCancelled = session.cancelled;
-            final long totalPlayedMs = NorthboundSession.computeConsumedAudioMs(
-                    session.pcmBytesWritten,
-                    session.sampleRate,
-                    session.channels);
-            activeStreams.remove(session.taskId, session);
-            session.chunkQueue.clear();
-            releaseSessionTrackSafely(session, wasCancelled);
+            boolean wasCancelled = st.cancelled;
+            final long totalPlayedMs = (result != null)
+                    ? result.totalPlayedMs
+                    : NorthboundSession.computeConsumedAudioMs(st.pcmBytesWritten, st.sampleRate, st.channels);
+            activeStreams.remove(st.taskId, session);
+            st.chunkQueue.clear();
+            PlaybackStreamDriver.releaseTrackSafely(st, wasCancelled);
             updateMediaDucking();
-            boolean anyActive = hasActiveMediaPlayback() || hasActiveVoicePlayback();
+            int stoppedChan = st.isMedia
+                    ? SoftwareAecFilter.CHANNEL_MEDIA
+                    : SoftwareAecFilter.CHANNEL_VOICE;
+            softwareAec.notifyChannelStopped(stoppedChan);
+            kwsPlaybackAec.notifyChannelStopped(stoppedChan);
+            boolean anyActive = hasActiveAnyPlayback();
+            if (!anyActive) {
+                softwareAec.notifyPlaybackStopped();
+                kwsPlaybackAec.notifyPlaybackStopped();
+            }
             callback.onPlaybackActiveChanged(anyActive);
             updateFocusAfterStreamChange();
-            if (reachedEos && !wasCancelled) {
-                callback.onPlaybackFinished(session.taskId, totalPlayedMs);
+            if (result != null && result.playbackFailedDetail != null) {
+                callback.onPlaybackFailed(st.taskId, result.playbackFailedDetail);
+            } else if (result != null && result.reachedEos && !wasCancelled) {
+                callback.onPlaybackFinished(st.taskId, totalPlayedMs, result.measuredHwDelay ? "hw_delay" : "written");
             }
         }
     }
@@ -810,41 +899,21 @@ public final class AudioEngine {
             return new NorthboundSession.StopPlaybackResult(false, 0L, 0L, "hw_delay");
         }
 
-        session.cancelled = true;
-        session.chunkQueue.clear();
-
-        long writtenMs = NorthboundSession.computeConsumedAudioMs(
-                session.pcmBytesWritten, session.sampleRate, session.channels);
-        long consumedMs = writtenMs;
-        String basis = "written_bytes";
-
-        synchronized (session.trackLock) {
-            if (!session.released) {
-                try {
-                    long headFrames = session.readUnwrappedHeadFramesLocked();
-                    long hwMs = (headFrames * 1000L) / Math.max(1, session.sampleRate);
-                    if (hwMs >= 0L) {
-                        consumedMs = Math.min(writtenMs, hwMs);
-                        basis = "hw_delay";
-                    }
-                } catch (Throwable ignored) {
-                }
-                try {
-                    session.track.pause();
-                    session.track.flush();
-                } catch (Throwable ignored) {
-                }
-            }
-        }
-
-        Thread wt = session.writerThread;
-        if (wt != null) {
-            wt.interrupt();
-        }
+        NorthboundSession.StopPlaybackResult res = PlaybackStreamDriver.stopAndMeasure(session.state);
         updateMediaDucking();
-        callback.onPlaybackActiveChanged(hasActiveMediaPlayback() || hasActiveVoicePlayback());
+        int stoppedChan = session.state.isMedia
+                ? SoftwareAecFilter.CHANNEL_MEDIA
+                : SoftwareAecFilter.CHANNEL_VOICE;
+        softwareAec.notifyChannelStopped(stoppedChan);
+        kwsPlaybackAec.notifyChannelStopped(stoppedChan);
+        boolean anyActiveAfterStop = hasActiveAnyPlayback();
+        if (!anyActiveAfterStop) {
+            softwareAec.notifyPlaybackStopped();
+            kwsPlaybackAec.notifyPlaybackStopped();
+        }
+        callback.onPlaybackActiveChanged(anyActiveAfterStop);
         updateFocusAfterStreamChange();
-        return new NorthboundSession.StopPlaybackResult(true, writtenMs, consumedMs, basis);
+        return res;
     }
 
     public List<String> stopAndFlush() {
@@ -854,26 +923,12 @@ public final class AudioEngine {
         for (String key : new ArrayList<String>(activeStreams.keySet())) {
             StreamSession session = activeStreams.remove(key);
             if (session != null) {
-                if (session.isMedia) {
+                if (session.state.isMedia) {
                     hadMedia = true;
                 } else {
                     hadVoice = true;
                 }
-                session.cancelled = true;
-                session.chunkQueue.clear();
-                synchronized (session.trackLock) {
-                    if (!session.released) {
-                        try {
-                            session.track.pause();
-                            session.track.flush();
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                }
-                Thread wt = session.writerThread;
-                if (wt != null) {
-                    wt.interrupt();
-                }
+                PlaybackStreamDriver.stopAndMeasure(session.state);
             }
         }
         if (hadVoice) {
@@ -882,17 +937,33 @@ public final class AudioEngine {
         if (hadMedia) {
             flushedChannels.add("music");
         }
+        if (hadVoice || hadMedia) {
+            softwareAec.notifyPlaybackStopped();
+            kwsPlaybackAec.notifyPlaybackStopped();
+        }
         callback.onPlaybackActiveChanged(false);
         updateFocusAfterStreamChange();
         return flushedChannels;
     }
 
     private void stopMediaStreamsOnly() {
+        List<String> stoppedIds = new ArrayList<String>();
+        List<NorthboundSession.StopPlaybackResult> stoppedResults = new ArrayList<NorthboundSession.StopPlaybackResult>();
         for (String key : new ArrayList<String>(activeStreams.keySet())) {
             StreamSession s = activeStreams.get(key);
-            if (s != null && s.isMedia) {
-                stopStream(key);
+            if (s != null && s.state.isMedia) {
+                NorthboundSession.StopPlaybackResult res = stopStream(key);
+                if (res != null && res.found) {
+                    stoppedIds.add(key);
+                    stoppedResults.add(res);
+                }
             }
+        }
+        if (!stoppedIds.isEmpty()) {
+            // NEVER emit play_finished on AUDIOFOCUS_LOSS (that would destroy Core's music session
+            // or auto-advance to the next track and steal audio focus back). Delegate clean pause
+            // + stop_receipt reporting to GatewayService instead.
+            callback.onAudioFocusLostMedia(stoppedIds, stoppedResults);
         }
     }
 
@@ -900,10 +971,10 @@ public final class AudioEngine {
         boolean voiceActive = hasActiveVoicePlayback();
         float mediaGain = (voiceActive || focusDucked) ? 0.20f : 1.0f;
         for (StreamSession s : activeStreams.values()) {
-            if (!s.cancelled && s.isMedia) {
+            if (!s.state.cancelled && s.state.isMedia) {
                 s.currentTrackGain = mediaGain;
-                synchronized (s.trackLock) {
-                    if (!s.released) {
+                synchronized (s.state.trackLock) {
+                    if (!s.state.released) {
                         try {
                             s.track.setVolume(mediaGain);
                         } catch (Throwable ignored) {
@@ -980,7 +1051,7 @@ public final class AudioEngine {
                 if (hasVoiceFocus && !hasActiveVoicePlayback()) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && voiceFocusRequest != null) {
                         am.abandonAudioFocusRequest(voiceFocusRequest);
-                    } else {
+                    } else if (!hasActiveMediaPlayback()) {
                         am.abandonAudioFocus(focusChangeListener);
                     }
                     hasVoiceFocus = false;
@@ -988,7 +1059,7 @@ public final class AudioEngine {
                 if (hasMediaFocus && !hasActiveMediaPlayback()) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && mediaFocusRequest != null) {
                         am.abandonAudioFocusRequest(mediaFocusRequest);
-                    } else {
+                    } else if (!hasActiveVoicePlayback()) {
                         am.abandonAudioFocus(focusChangeListener);
                     }
                     hasMediaFocus = false;
@@ -1072,26 +1143,5 @@ public final class AudioEngine {
 
     private static boolean isMediaChannel(String channel) {
         return "media".equalsIgnoreCase(channel) || "music".equalsIgnoreCase(channel);
-    }
-
-    private static void releaseSessionTrackSafely(StreamSession session, boolean flushFirst) {
-        synchronized (session.trackLock) {
-            if (session.released) {
-                return;
-            }
-            session.released = true;
-            try {
-                if (flushFirst) {
-                    session.track.pause();
-                    session.track.flush();
-                }
-                session.track.stop();
-            } catch (Throwable ignored) {
-            }
-            try {
-                session.track.release();
-            } catch (Throwable ignored) {
-            }
-        }
     }
 }

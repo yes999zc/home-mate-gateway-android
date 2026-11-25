@@ -32,20 +32,20 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import homes.mymate.gateway.protocol.AcousticGuard;
+import homes.mymate.gateway.protocol.BoundedTwoTierQueue;
 import homes.mymate.gateway.protocol.CoreApiClient;
 import homes.mymate.gateway.protocol.CoreDiscovery;
+import homes.mymate.gateway.protocol.DeviceRoutingPolicy;
 import homes.mymate.gateway.protocol.LocalKwsEngine;
 import homes.mymate.gateway.protocol.MiniJson;
 import homes.mymate.gateway.protocol.NorthboundSession;
+import homes.mymate.gateway.protocol.TranscriptStateStore;
 
 /**
  * Persistent 24/7 Foreground Service for Home Mate Android Universal Client (v2.0).
@@ -66,7 +66,7 @@ public final class GatewayService extends Service {
     private static final String CHANNEL_ID = "home_mate_gateway_channel";
     private static final int NOTIFICATION_ID = 8932;
     private static final int MAX_LOG_LINES = 120;
-    private static final int AUDIO_TX_QUEUE_CAP = 16;
+    private static final int AUDIO_TX_QUEUE_CAP = 32;
     private static final long TX_STALL_WATCHDOG_MS = 4000L;
 
     public interface UiTelemetryListener {
@@ -82,7 +82,7 @@ public final class GatewayService extends Service {
     }
 
     public interface ModeApplyCallback {
-        void onModeApplied(boolean ok);
+        void onModeApplied(boolean ok, boolean authRequired);
     }
 
     public interface RoomSummariesCallback {
@@ -90,7 +90,19 @@ public final class GatewayService extends Service {
     }
 
     public interface ActionResultCallback {
-        void onActionDone(boolean ok);
+        void onActionDone(boolean ok, boolean authRequired);
+    }
+
+    public interface HistoryCallback {
+        void onHistoryLoaded(
+                List<CoreApiClient.ChatEntry> messages,
+                String currentSessionId,
+                boolean authRequired,
+                boolean ok);
+    }
+
+    public interface TokenVerifyCallback {
+        void onTokenVerified(CoreApiClient.TokenVerifyResult result, String sanitizedToken);
     }
 
     public final class LocalBinder extends Binder {
@@ -101,16 +113,25 @@ public final class GatewayService extends Service {
 
     /**
      * 2-tier non-blocking outbound transport decoupling audio capture from socket flush latency.
+     * Backed by {@link BoundedTwoTierQueue} so concurrent producers and writer never leak permits
+     * or stall on underflow.
      */
     private final class TwoTierOutboundTransport implements NorthboundSession.FrameTransport {
         private final Socket socket;
         private final BufferedWriter writer;
-        private final LinkedBlockingQueue<String> controlQueue = new LinkedBlockingQueue<String>(256);
-        private final ArrayBlockingQueue<String> audioQueue = new ArrayBlockingQueue<String>(AUDIO_TX_QUEUE_CAP);
-        private final Semaphore permits = new Semaphore(0);
+        private final BoundedTwoTierQueue queue = new BoundedTwoTierQueue(256, AUDIO_TX_QUEUE_CAP);
+        private final ThreadLocal<Boolean> orderedControlBurst = new ThreadLocal<Boolean>();
         private volatile boolean alive = true;
         private volatile long writeStartedMs = 0L;
         private final Thread txThread;
+
+        void beginOrderedBurst() {
+            orderedControlBurst.set(Boolean.TRUE);
+        }
+
+        void endOrderedBurst() {
+            orderedControlBurst.remove();
+        }
 
         TwoTierOutboundTransport(Socket socket, BufferedWriter writer) {
             this.socket = socket;
@@ -127,22 +148,15 @@ public final class GatewayService extends Service {
 
         @Override
         public void sendJsonLine(String jsonLine) throws IOException {
-            if (!alive) {
+            if (!alive || queue.isClosed()) {
                 throw new IOException("Outbound transport closed");
             }
-            boolean isAudioBulk = jsonLine.contains("\"type\":\"audio_chunk\"")
-                    || jsonLine.contains("\"type\":\"near_end_presence\"");
-            if (isAudioBulk) {
-                while (!audioQueue.offer(jsonLine)) {
-                    audioQueue.poll(); // drop oldest audio frame under Tailscale jitter
-                }
-                permits.release();
-            } else {
-                if (!controlQueue.offer(jsonLine)) {
-                    controlQueue.poll();
-                    controlQueue.offer(jsonLine);
-                }
-                permits.release();
+            boolean inOrderedBurst = Boolean.TRUE.equals(orderedControlBurst.get());
+            boolean isAudioBulk = !inOrderedBurst
+                    && (jsonLine.contains("\"type\":\"audio_chunk\"")
+                        || jsonLine.contains("\"type\":\"near_end_presence\""));
+            if (!queue.enqueue(jsonLine, isAudioBulk)) {
+                throw new IOException("Outbound transport closed");
             }
         }
 
@@ -160,18 +174,14 @@ public final class GatewayService extends Service {
 
         void stop() {
             alive = false;
-            permits.release();
+            queue.close();
             txThread.interrupt();
         }
 
         private void runTxLoop() {
             try {
                 while (alive && !Thread.currentThread().isInterrupted()) {
-                    permits.tryAcquire(250L, TimeUnit.MILLISECONDS);
-                    String line = controlQueue.poll();
-                    if (line == null) {
-                        line = audioQueue.poll();
-                    }
+                    String line = queue.takeNext(250L);
                     if (line == null) {
                         continue;
                     }
@@ -193,6 +203,7 @@ public final class GatewayService extends Service {
             } finally {
                 writeStartedMs = 0L;
                 alive = false;
+                queue.close();
             }
         }
     }
@@ -211,7 +222,16 @@ public final class GatewayService extends Service {
     private volatile boolean serviceRunning = false;
     private volatile boolean uiForeground = false;
     private volatile boolean fromBootRestricted = false;
+    private volatile boolean micFgsGranted = false;
+    private volatile boolean captureStartedWhileBootRestricted = false;
+    private volatile boolean desiredMuted = false;
+    private volatile long lastAecDiagLogWallMs = 0L;
+    private volatile long lastAecEchoHealthWallMs = 0L;
     private final AtomicBoolean intentionalReconnect = new AtomicBoolean(false);
+    // Dedicated lock guarding all transcriptEpoch, lastRawServerTranscript, localManageTranscripts,
+    // localVoiceTurns, manageOnlySessionIds, and coreSnapshot transcript commits atomically (P1-1).
+    private final Object transcriptSyncLock = new Object();
+    private final TranscriptStateStore transcriptState = new TranscriptStateStore(transcriptSyncLock);
     private Thread connectionThread;
     private Thread apiPollThread;
     private volatile Socket activeSocket;
@@ -223,15 +243,101 @@ public final class GatewayService extends Service {
     private volatile String connectionStatus = "Connecting...";
     private volatile boolean connected = false;
     private volatile boolean voiceAuthRequired = false;
+    private volatile boolean apiAuthRequired = false;
     private volatile String assistantState = "idle";
     private volatile double lastRmsDbfs = -72.0;
     private volatile double lastNoiseFloorDbfs = -58.0;
     private volatile double lastSnrDb = 0.0;
     private volatile long blocksSent = 0;
     private volatile long lastAudioUiNotifyMs = 0L;
-    private volatile boolean localVadSpeech = false;
-    private volatile String lastActionSubtitle = "";
-    private volatile CoreApiClient.CoreSnapshot coreSnapshot = CoreApiClient.CoreSnapshot.offline("init");
+    public static final class PendingConfirmation {
+        public final String host;
+        public final int webPort;
+        public final String actionId;
+        public final String summary;
+        public final String tool;
+        public final String expectedState;
+        public final long expectedRevision;
+
+        public PendingConfirmation(
+                String host,
+                int webPort,
+                String actionId,
+                String summary,
+                String tool,
+                String expectedState,
+                long expectedRevision) {
+            this.host = host != null ? host : "";
+            this.webPort = webPort;
+            this.actionId = actionId != null ? actionId : "";
+            this.summary = summary != null ? summary : "";
+            this.tool = tool != null ? tool : "";
+            this.expectedState = (expectedState != null && !expectedState.isEmpty()) ? expectedState : "pending";
+            this.expectedRevision = Math.max(0L, expectedRevision);
+        }
+    }
+
+    private volatile PendingConfirmation pendingConfirmation = null;
+
+    public PendingConfirmation getPendingConfirmation() {
+        return pendingConfirmation;
+    }
+
+    public void dismissPendingConfirmation(String actionId) {
+        PendingConfirmation cur = pendingConfirmation;
+        if (cur != null && (actionId == null || actionId.equals(cur.actionId))) {
+            pendingConfirmation = null;
+        }
+    }
+
+    public void decidePendingConfirmationAsync(
+            final PendingConfirmation req,
+            final boolean approve,
+            final ActionResultCallback callback) {
+        if (req == null || req.actionId.isEmpty()) {
+            if (callback != null) {
+                callback.onActionDone(false, false);
+            }
+            return;
+        }
+        final long confCoreEpoch = transcriptState.getCoreSwitchEpoch();
+        final long confTranscriptEpoch = transcriptState.getTranscriptEpoch();
+        final boolean manageOnly = config.isManageOnly();
+        dismissPendingConfirmation(req.actionId);
+        sendAsync(new Runnable() {
+            @Override
+            public void run() {
+                String token = config.getBearerTokenForHost(req.host);
+                CoreApiClient.ActionOutcome outcome = CoreApiClient.decideConfirmationWithResult(
+                        req.host, req.webPort, req.actionId,
+                        req.expectedState, req.expectedRevision,
+                        approve, token);
+                boolean ok = outcome.ok;
+                if (outcome.authRequired) {
+                    noteApiAuthFailure(req.host, true, confCoreEpoch, false);
+                }
+                String lang = config.getLanguage();
+                String feedbackKey = ok
+                        ? (approve ? "confirm_action_approved" : "confirm_action_denied")
+                        : (approve ? "confirm_action_approve_failed" : "confirm_action_deny_failed");
+                transcriptState.appendLocalManageChatEntry(
+                        req.host,
+                        "assistant",
+                        I18n.t(lang, feedbackKey),
+                        confCoreEpoch,
+                        confTranscriptEpoch,
+                        manageOnly);
+                notifyUi();
+                refreshCoreSnapshotNow();
+                if (callback != null) {
+                    callback.onActionDone(ok, outcome.authRequired);
+                }
+            }
+        });
+    }
+
+    private volatile String lastTransientError = null;
+    private final String processBootId = "android-boot-" + System.currentTimeMillis();
     private volatile List<CoreDiscovery.DiscoveredCore> lastDiscoveredCores = java.util.Collections.emptyList();
     private volatile long lastAutoScanMs = 0L;
     private final AtomicBoolean lanScanInFlight = new AtomicBoolean(false);
@@ -241,6 +347,7 @@ public final class GatewayService extends Service {
     public void onCreate() {
         super.onCreate();
         config = new GatewayConfig(this);
+        desiredMuted = config.isDesiredMuted();
         acquireWakeLock();
 
         mediaSessionController = new MediaSessionController(this, new MediaSessionController.MediaActionListener() {
@@ -261,10 +368,11 @@ public final class GatewayService extends Service {
 
             @Override
             public void onMediaStop() {
-                triggerManualRetreat("停止播放");
+                triggerManualRetreat(null);
             }
         });
-        startInForeground();
+        // Defer startInForeground() to onStartCommand() / onBind() so Android 14 boot-restricted
+        // intents can set `fromBootRestricted` before requesting FOREGROUND_SERVICE_TYPE_MICROPHONE.
 
         // Prepare KWS workspace on background hm-kws-engine thread (never blocks Main thread)
         File kwsWorkDir = KwsAssetInstaller.getKwsWorkDir(this);
@@ -274,8 +382,9 @@ public final class GatewayService extends Service {
         kwsEngine = new LocalKwsEngine(kwsWorkDir, nativeDir, config.getDeviceId(), new LocalKwsEngine.EventListener() {
             @Override
             public void onKwsReady(double threshold, double score, String loadedHash) {
-                appendLog("KWS", String.format(Locale.US, "engine=%s ready (thr=%.2f score=%.2f)",
-                        kwsEngine.getActiveEngineMode(), threshold, score));
+                appendLog("KWS", String.format(Locale.US, "engine=%s ready (thr=%.2f score=%.2f hash=%s)",
+                        kwsEngine.getActiveEngineMode(), threshold, score,
+                        loadedHash != null ? loadedHash : ""));
                 NorthboundSession s = activeSession;
                 if (s != null) {
                     s.setLocalOfflineKwsReady(true);
@@ -283,10 +392,19 @@ public final class GatewayService extends Service {
                         try {
                             s.sendKwsReport("running", String.format(Locale.US,
                                     "%s ready (threshold=%.2f score=%.2f)",
-                                    kwsEngine.getActiveEngineMode(), threshold, score));
+                                    kwsEngine.getActiveEngineMode(), threshold, score), loadedHash);
                         } catch (IOException ignored) {
                         }
                     }
+                }
+                final CoreApiClient.CoreSnapshot snapNow = transcriptState.getSnapshot();
+                if (connected && snapNow != null && snapNow.reflexTable != null) {
+                    sendAsync(new Runnable() {
+                        @Override
+                        public void run() {
+                            syncReflexTableFromSnapshot(snapNow);
+                        }
+                    });
                 }
                 notifyUi();
             }
@@ -294,8 +412,19 @@ public final class GatewayService extends Service {
             @Override
             public void onKeywordDetected(final LocalKwsEngine.KwsEvent hit, final boolean isRetreatWord) {
                 final long now = System.currentTimeMillis();
+                final homes.mymate.gateway.protocol.SoftwareAecFilter.AecTelemetry aecSnap =
+                        audioEngine.getActiveAecTelemetry();
+                final boolean anyPlayAtHit = audioEngine.hasActiveAnyPlayback();
+                final String kwsDiag = String.format(Locale.US,
+                        "hit=%s retreat=%s playing=%s lag=%dms %s",
+                        hit.keyword, isRetreatWord ? "1" : "0", anyPlayAtHit ? "1" : "0",
+                        hit.lagMs, aecSnap.formatCompact());
+                appendLog("KWS", kwsDiag);
+                android.util.Log.i("HomeMateGateway", "KWS " + kwsDiag);
+                final boolean aecCancelling = audioEngine.isSoftwareAecEnabled()
+                        || aecSnap.erleDb >= 3.0;
                 final boolean selfHeard = !isRetreatWord
-                        && !audioEngine.isSoftwareAecEnabled()
+                        && !aecCancelling
                         && acousticGuard.isSelfHeardEcho(lastRmsDbfs, now);
                 if (isRetreatWord) {
                     final long t0 = System.currentTimeMillis();
@@ -303,7 +432,6 @@ public final class GatewayService extends Service {
                     final long latencyMs = Math.max(1L, System.currentTimeMillis() - t0);
                     acousticGuard.onPlaybackStopped();
                     assistantState = "idle";
-                    lastActionSubtitle = "KWS: " + hit.keyword;
                     syncHardwareAndMedia();
                     notifyUi();
                     sendAsync(new Runnable() {
@@ -319,8 +447,10 @@ public final class GatewayService extends Service {
                         }
                     });
                 } else {
-                    assistantState = "listening";
-                    lastActionSubtitle = "KWS: " + hit.keyword;
+                    final boolean isSuspect = "suspect".equalsIgnoreCase(hit.tier);
+                    if (connected && !isSuspect) {
+                        assistantState = "listening";
+                    }
                     syncHardwareAndMedia();
                     notifyUi();
                     sendAsync(new Runnable() {
@@ -328,11 +458,23 @@ public final class GatewayService extends Service {
                         public void run() {
                             NorthboundSession s = activeSession;
                             if (s != null && connected) {
+                                TwoTierOutboundTransport tx = activeTxTransport;
+                                if (!isSuspect && tx != null) {
+                                    tx.beginOrderedBurst();
+                                }
                                 try {
-                                    // Flush recent local preroll PCM BEFORE sending keyword so one-breath utterances are preserved
-                                    s.notifyWakeForUplinkAndFlushPreroll(now);
-                                    s.sendKwsKeywordFact(hit, lastRmsDbfs, selfHeard);
+                                    if (!isSuspect) {
+                                        // Atomically flush full wake-word preroll PCM BEFORE keyword and
+                                        // reopen live capture ONLY after both are queued (zero seq inversion).
+                                        s.flushPrerollAndSendKwsKeywordFact(now, hit, lastRmsDbfs, selfHeard);
+                                    } else {
+                                        s.sendKwsKeywordFact(hit, lastRmsDbfs, selfHeard);
+                                    }
                                 } catch (IOException ignored) {
+                                } finally {
+                                    if (!isSuspect && tx != null) {
+                                        tx.endOrderedBurst();
+                                    }
                                 }
                             }
                         }
@@ -342,8 +484,7 @@ public final class GatewayService extends Service {
 
             @Override
             public void onVadSpeechChanged(boolean speech) {
-                localVadSpeech = speech;
-                notifyUi();
+                // Local VAD hint handled inside LocalKwsEngine; UI orb reacts directly to live PCM RMS.
             }
 
             @Override
@@ -366,7 +507,7 @@ public final class GatewayService extends Service {
         kwsEngine.setAssetPreparer(new LocalKwsEngine.AssetPreparer() {
             @Override
             public void prepareWorkspace() {
-                KwsAssetInstaller.prepareKwsWorkspace(GatewayService.this);
+                KwsAssetInstaller.prepareKwsWorkspace(GatewayService.this, kwsEngine);
             }
         });
         kwsEngine.setSensitivity(config.getKwsThreshold(), config.getKwsScore());
@@ -374,7 +515,7 @@ public final class GatewayService extends Service {
 
         audioEngine = new AudioEngine(this, new AudioEngine.CaptureCallback() {
             @Override
-            public void onAudioBlockCaptured(byte[] pcm16leBytes, double rmsDbfs, double noiseFloorDbfs, double snrDb, boolean aecActive) {
+            public void onAudioBlockCaptured(byte[] pcm16leBytes, byte[] kwsPcm16leBytes, double rmsDbfs, double noiseFloorDbfs, double snrDb, boolean aecActive) {
                 lastRmsDbfs = rmsDbfs;
                 lastNoiseFloorDbfs = noiseFloorDbfs;
                 lastSnrDb = snrDb;
@@ -396,20 +537,58 @@ public final class GatewayService extends Service {
 
                 long nowMs = System.currentTimeMillis();
                 if (kwsEngine != null) {
-                    kwsEngine.feedPcmBlock(pcm16leBytes, nowMs, snrDb < 5.0);
+                    byte[] kwsInput = (kwsPcm16leBytes != null) ? kwsPcm16leBytes : pcm16leBytes;
+                    kwsEngine.feedPcmBlock(kwsInput, nowMs, snrDb < 5.0);
                 }
 
                 NorthboundSession session = activeSession;
-                boolean bargeInAllowed = session != null
-                        && "full".equalsIgnoreCase(session.getDuplexMode())
-                        && audioEngine.hasActiveVoicePlayback();
+                if (session != null) {
+                    boolean prevAec = session.isAecActive();
+                    session.setAecActive(aecActive);
+                    session.setAecTailMs(aecActive ? 160 : 0);
+                    if (prevAec != aecActive && connected && session.isHelloAckReceived()) {
+                        try {
+                            session.sendEchoHealth(session.currentEchoHealth(), 0L, session.currentEchoHealthReason());
+                        } catch (IOException ignored) {
+                        }
+                    }
+                }
+                boolean anyPlayback = audioEngine.hasActiveVoicePlayback() || audioEngine.hasActiveMediaPlayback();
+                if (anyPlayback && (nowMs - lastAecDiagLogWallMs) >= 2000L) {
+                    lastAecDiagLogWallMs = nowMs;
+                    homes.mymate.gateway.protocol.SoftwareAecFilter.AecTelemetry snap =
+                            audioEngine.getActiveAecTelemetry();
+                    String diagLine = snap.formatCompact();
+                    appendLog("AEC", diagLine);
+                    android.util.Log.i("HomeMateGateway", "AEC " + diagLine);
+                    if (session != null && connected && session.isHelloAckReceived()
+                            && (nowMs - lastAecEchoHealthWallMs) >= 5000L) {
+                        lastAecEchoHealthWallMs = nowMs;
+                        try {
+                            String eh = session.currentEchoHealth();
+                            String er = session.currentEchoHealthReason() + ";" + snap.formatEchoHealthSuffix();
+                            session.sendEchoHealth(eh, 0L, er);
+                        } catch (IOException ignored) {
+                        }
+                    }
+                }
+                CoreApiClient.CoreSnapshot snapNow = transcriptState.getSnapshot();
+                String activeDuplex = session != null ? session.getDuplexMode() : "half";
+                boolean coreBargeIn = snapNow != null && snapNow.bargeIn;
+                boolean bargeInUplinkAllowed = session != null
+                        && DeviceRoutingPolicy.shouldAllowBargeInUplink(activeDuplex, anyPlayback);
+                boolean acousticBargeInAllowed = session != null
+                        && DeviceRoutingPolicy.shouldAllowAcousticBargeIn(activeDuplex, coreBargeIn, anyPlayback);
+                boolean aecRefLocked = audioEngine.isHardwareAecEnabled()
+                        || (audioEngine.isSoftwareAecEnabled() && audioEngine.getSoftwareAecErleDb() > 0.5)
+                        || (audioEngine.getKwsPlaybackAecErleDb() > 2.0);
 
                 final AcousticGuard.BargeInFact bargeFact = acousticGuard.pushCaptureBlockAndCheckBargeIn(
-                        pcm16leBytes, rmsDbfs, noiseFloorDbfs, bargeInAllowed, nowMs);
+                        pcm16leBytes, rmsDbfs, noiseFloorDbfs, acousticBargeInAllowed, aecRefLocked, nowMs);
 
                 if (session != null && connected && session.isHelloAckReceived()) {
                     try {
-                        if (session.sendAudioChunkWithGate(pcm16leBytes, rmsDbfs, noiseFloorDbfs, bargeInAllowed, nowMs)) {
+                        if (session.sendAudioChunkWithGate(pcm16leBytes, rmsDbfs, noiseFloorDbfs, bargeInUplinkAllowed, nowMs)) {
                             blocksSent++;
                         }
                         if (bargeFact != null) {
@@ -460,47 +639,80 @@ public final class GatewayService extends Service {
             }
 
             @Override
-            public void onPlaybackFinished(String taskId, long playedMs) {
+            public void onPlaybackFinished(String taskId, long playedMs, String progressBasis) {
                 syncHardwareAndMedia();
                 NorthboundSession session = activeSession;
                 if (session != null && connected) {
                     try {
-                        session.sendPlayFinished(taskId, playedMs);
+                        session.sendPlayFinished(taskId, playedMs, progressBasis);
                     } catch (IOException ignored) {
                     }
                 }
             }
 
             @Override
+            public void onPlaybackFailed(String taskId, String detail) {
+                if (!audioEngine.hasActiveVoicePlayback() && !audioEngine.hasActiveMediaPlayback()) {
+                    acousticGuard.onPlaybackStopped();
+                    if ("speaking".equalsIgnoreCase(assistantState)) {
+                        assistantState = "idle";
+                    }
+                }
+                syncHardwareAndMedia();
+                NorthboundSession session = activeSession;
+                if (session != null && connected) {
+                    try {
+                        session.sendPlayFailed(taskId, detail);
+                    } catch (IOException ignored) {
+                    }
+                }
+                notifyUi();
+            }
+
+            @Override
+            public void onAudioFocusGained() {
+                ensureCaptureRunningIfPermitted();
+            }
+
+            @Override
+            public void onAudioFocusLostMedia(
+                    final List<String> stoppedTaskIds,
+                    final List<NorthboundSession.StopPlaybackResult> stopResults) {
+                appendLog("AUDIO", "AUDIOFOCUS_LOSS: paused " + stoppedTaskIds.size() + " media stream(s) cleanly");
+                syncHardwareAndMedia();
+                notifyUi();
+                sendAsync(new Runnable() {
+                    @Override
+                    public void run() {
+                        NorthboundSession session = activeSession;
+                        if (session != null && connected) {
+                            try {
+                                session.sendAudioFocusLostMediaPause(stoppedTaskIds, stopResults);
+                            } catch (IOException e) {
+                                appendLog("ERR", "sendAudioFocusLostMediaPause failed: " + e.getMessage());
+                            }
+                        }
+                    }
+                });
+            }
+
+            @Override
             public void onAudioError(String stage, String message) {
                 appendLog("AUDIO", stage + ": " + message);
-                lastActionSubtitle = message;
                 notifyUi();
             }
         });
 
-        hardwareAdapter = HardwareAdapter.Factory.createAndAttach(
-                this,
-                config.isR1HookEnabled(),
-                new R1HardwareHook.HardwareEventListener() {
-                    @Override
-                    public void onHardwareWakeTriggered(String keyword) {
-                        triggerManualWake(keyword);
-                    }
-
-                    @Override
-                    public void onHardwareTopButtonShortPress() {
-                        triggerManualRetreat("退下");
-                    }
-                });
+        hardwareAdapter = HardwareAdapter.Factory.createAndAttach(config.isR1HookEnabled());
 
         registerNetworkCallback();
-        startGatewayLoop();
-        triggerAutoLanDiscoveryIfNeeded(false);
+        // P1-4: Defer startGatewayLoop() (and AudioRecord creation) until onStartCommand() / onBind()
+        // inspects EXTRA_FROM_BOOT and establishes the true FGS type (avoiding silenced boot AudioRecord).
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        boolean prevMicFgs = micFgsGranted;
         if (intent != null && intent.getBooleanExtra(EXTRA_FROM_BOOT, false)) {
             fromBootRestricted = (Build.VERSION.SDK_INT >= 30);
         } else {
@@ -509,15 +721,36 @@ public final class GatewayService extends Service {
         startInForeground();
         if (!serviceRunning) {
             startGatewayLoop();
+        } else {
+            syncCaptureWithFgsState(prevMicFgs);
         }
         return START_STICKY;
     }
 
     @Override
     public IBinder onBind(Intent intent) {
+        boolean prevMicFgs = micFgsGranted;
         fromBootRestricted = false;
         startInForeground();
+        if (!serviceRunning) {
+            startGatewayLoop();
+        } else {
+            syncCaptureWithFgsState(prevMicFgs);
+        }
         return binder;
+    }
+
+    @Override
+    public void onRebind(Intent intent) {
+        super.onRebind(intent);
+        boolean prevMicFgs = micFgsGranted;
+        fromBootRestricted = false;
+        startInForeground();
+        if (!serviceRunning) {
+            startGatewayLoop();
+        } else {
+            syncCaptureWithFgsState(prevMicFgs);
+        }
     }
 
     @Override
@@ -554,36 +787,103 @@ public final class GatewayService extends Service {
         }
     }
 
-    public GatewayConfig getConfig() { return config; }
     public boolean isConnected() { return connected; }
-    public boolean isVoiceAuthRequired() { return voiceAuthRequired; }
-    public boolean isAuthRequired() { return voiceAuthRequired || (coreSnapshot != null && coreSnapshot.authRequired); }
-    public boolean isHttpManageOnline() { return coreSnapshot != null && coreSnapshot.reachable && !coreSnapshot.authRequired; }
-    public boolean isAnyOnline() { return connected || isHttpManageOnline(); }
+    public boolean isManageOnlyMode() { return config != null && config.isManageOnly(); }
+    public boolean isAuthRequired() {
+        CoreApiClient.CoreSnapshot snap = transcriptState.getSnapshot();
+        return voiceAuthRequired || apiAuthRequired || (snap != null && snap.authRequired);
+    }
+    public boolean isHttpManageOnline() {
+        CoreApiClient.CoreSnapshot snap = transcriptState.getSnapshot();
+        return snap != null && snap.reachable && !snap.authRequired;
+    }
+    public boolean isAnyOnline() { return connected || (isManageOnlyMode() && isHttpManageOnline()); }
+    public String consumeTransientError() {
+        String err = lastTransientError;
+        lastTransientError = null;
+        return err;
+    }
     public List<CoreDiscovery.DiscoveredCore> getLastDiscoveredCores() { return lastDiscoveredCores; }
-    public String getConnectionStatus() { return connectionStatus; }
     public String getAssistantState() { return assistantState; }
     public double getLastRmsDbfs() { return lastRmsDbfs; }
     public double getLastNoiseFloorDbfs() { return lastNoiseFloorDbfs; }
     public double getLastSnrDb() { return lastSnrDb; }
     public long getBlocksSent() { return blocksSent; }
-    public boolean isLocalVadSpeech() { return localVadSpeech; }
-    public String getLastActionSubtitle() { return lastActionSubtitle; }
-    public CoreApiClient.CoreSnapshot getCoreSnapshot() { return coreSnapshot; }
+    public CoreApiClient.CoreSnapshot getCoreSnapshot() { return transcriptState.getSnapshot(); }
     public String getKwsEngineMode() { return kwsEngine != null ? kwsEngine.getActiveEngineMode() : LocalKwsEngine.MODE_ASR_HYBRID; }
     public long getKwsDetectionCount() { return kwsEngine != null ? kwsEngine.getDetectionCount() : 0L; }
     public boolean isHardwareAecActive() { return audioEngine != null && audioEngine.isHardwareAecEnabled(); }
     public boolean isSoftwareAecActive() { return audioEngine != null && audioEngine.isSoftwareAecEnabled(); }
     public double getSoftwareAecErleDb() { return audioEngine != null ? audioEngine.getSoftwareAecErleDb() : 0.0; }
-    public boolean isHardwareNsActive() { return audioEngine != null && audioEngine.isHardwareNsEnabled(); }
+    public homes.mymate.gateway.protocol.SoftwareAecFilter.AecTelemetry getActiveAecTelemetry() {
+        return audioEngine != null
+                ? audioEngine.getActiveAecTelemetry()
+                : new homes.mymate.gateway.protocol.SoftwareAecFilter.AecTelemetry(
+                        0.0, 0, -1, false, "unlocked", 0.0, 0.0, -96.0, -96.0);
+    }
     public boolean isLocalMediaPlaying() { return audioEngine != null && audioEngine.hasActiveMediaPlayback(); }
     public String getOutputRouteName() { return audioEngine != null ? audioEngine.getOutputRouteName() : "Speaker"; }
     public boolean isR1HardwareDetected() { return hardwareAdapter != null && hardwareAdapter.isSpecializedHardwareDetected(); }
     public String getHardwareAdapterName() { return hardwareAdapter != null ? hardwareAdapter.getAdapterName() : "Generic-Android"; }
 
+    private boolean canStartLiveMicCapture() {
+        if (!hasRecordAudioPermission()) {
+            return false;
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            return !fromBootRestricted && micFgsGranted;
+        }
+        return true;
+    }
+
+    private void syncCaptureWithFgsState(boolean prevMicFgsGranted) {
+        if (audioEngine == null || !hasRecordAudioPermission()) {
+            return;
+        }
+        if (!canStartLiveMicCapture()) {
+            return;
+        }
+        if (captureStartedWhileBootRestricted || (!prevMicFgsGranted && audioEngine.isCaptureRunning())) {
+            captureStartedWhileBootRestricted = false;
+            appendLog("AUDIO", "FGS upgraded to MICROPHONE; recreating AudioRecord cleanly");
+            audioEngine.restartCapture();
+        } else {
+            audioEngine.ensureCaptureRunning();
+        }
+    }
+
+    public void ensureCaptureRunningIfPermitted() {
+        if (audioEngine == null || !hasRecordAudioPermission()) {
+            return;
+        }
+        boolean prevMicFgs = micFgsGranted;
+        if (Build.VERSION.SDK_INT >= 30 && !fromBootRestricted && !micFgsGranted) {
+            startInForeground();
+        }
+        syncCaptureWithFgsState(prevMicFgs);
+    }
+
+    private void noteApiAuthFailure(String host, boolean authFailed, long expectedEpoch, boolean emitTransientToast) {
+        if (!authFailed) {
+            return;
+        }
+        if (expectedEpoch >= 0L && transcriptState.getCoreSwitchEpoch() != expectedEpoch) {
+            return;
+        }
+        if (host == null || config.activeProfileMatchesHost(host)) {
+            apiAuthRequired = true;
+            if (emitTransientToast) {
+                lastTransientError = I18n.t(config.getLanguage(), "auth_action_required_toast");
+            }
+            appendLog("AUTH", "HTTP 401/403 from " + (host != null ? host : config.getCoreHost())
+                    + " — pairing token required");
+            notifyUi();
+        }
+    }
+
     public boolean isMuted() {
         NorthboundSession s = activeSession;
-        return s != null && s.isMuted();
+        return s != null ? s.isMuted() : desiredMuted;
     }
 
     public double getVolumeLinear() {
@@ -603,35 +903,33 @@ public final class GatewayService extends Service {
     }
 
     private String resolveEffectiveDeviceId() {
-        CoreApiClient.CoreSnapshot snap = coreSnapshot;
-        if (!connected && snap != null && snap.devices != null && !snap.devices.isEmpty()) {
-            for (CoreApiClient.DeviceInfo d : snap.devices) {
-                if (d.connected && d.id != null && !d.id.isEmpty()) {
-                    return d.id;
-                }
-            }
-            String first = snap.devices.get(0).id;
-            if (first != null && !first.isEmpty()) {
-                return first;
-            }
-        }
-        return config.getDeviceId();
+        return DeviceRoutingPolicy.resolveEffectiveDeviceId(
+                config.getDeviceId(),
+                config.isManageOnly(),
+                transcriptState.getSnapshot());
+    }
+
+    private void resetCoreSwitchState() {
+        transcriptState.resetForCoreSwitch();
+        pendingConfirmation = null;
+        lastFailedReflexSyncHash = "";
+        voiceAuthRequired = false;
+        apiAuthRequired = false;
+        assistantState = "idle";
     }
 
     public void reloadConfigAndReconnect() {
+        boolean prevMicFgs = micFgsGranted;
         fromBootRestricted = false;
         startInForeground();
         audioEngine.configure(config.isUseVoiceCommAec(), config.isSoftwareAecEnabled(), config.getUplinkGain());
         if (kwsEngine != null) {
             kwsEngine.setSensitivity(config.getKwsThreshold(), config.getKwsScore());
         }
-        if (hasRecordAudioPermission()) {
-            audioEngine.startCapture();
-        }
-        // Reset stale snapshot & assistant state immediately so failover/Manage-Only checks never read previous Core state
-        coreSnapshot = CoreApiClient.CoreSnapshot.offline("switching");
-        voiceAuthRequired = false;
-        assistantState = "idle";
+        syncCaptureWithFgsState(prevMicFgs);
+        // Advance Core-switch epoch BEFORE resetting snapshot so in-flight HTTP polls for the
+        // previous Core cannot overwrite the newly selected Core's snapshot or KWS reflex table.
+        resetCoreSwitchState();
         intentionalReconnect.set(true);
         closeActiveSocket();
         Thread ct = connectionThread;
@@ -646,18 +944,107 @@ public final class GatewayService extends Service {
         if (kwsEngine != null) {
             kwsEngine.setSensitivity(config.getKwsThreshold(), config.getKwsScore());
         }
+        final NorthboundSession s = activeSession;
+        if (s != null) {
+            boolean prevAec = s.isAecActive();
+            boolean aecOn = audioEngine.isHardwareAecEnabled() || config.isSoftwareAecEnabled();
+            s.setAecActive(aecOn);
+            s.setAecTailMs(aecOn ? 160 : 0);
+            s.setKwsSensitivity(config.getKwsThreshold(), config.getKwsScore());
+            if (prevAec != aecOn && connected && s.isHelloAckReceived()) {
+                sendAsync(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            s.sendEchoHealth(s.currentEchoHealth(), 0L, s.currentEchoHealthReason());
+                        } catch (IOException ignored) {
+                        }
+                    }
+                });
+            }
+        }
         notifyUi();
     }
 
+    private final Object reflexSyncLock = new Object();
+    private volatile String lastFailedReflexSyncHash = "";
+
+    private void syncReflexTableFromSnapshot(CoreApiClient.CoreSnapshot snap) {
+        if (!connected || snap == null || snap.reflexTable == null || kwsEngine == null) {
+            return;
+        }
+        NorthboundSession liveSession = activeSession;
+        if (liveSession != null && !liveSession.shouldAllowHttpReflexSync()) {
+            return;
+        }
+        // Wait until workspace prep & initial JNI/sidecar load finish so we never race KwsAssetInstaller
+        // on kw.txt.tmp, never validate against an empty validTokenSet, and never deploy on slim APKs.
+        if (!kwsEngine.isProcessReady()) {
+            return;
+        }
+        CoreApiClient.ReflexSyncTable table = snap.reflexTable;
+        if (table.compiledKeywordsTxt.isEmpty() || table.hash.isEmpty()) {
+            return;
+        }
+        synchronized (reflexSyncLock) {
+            NorthboundSession lockedSession = activeSession;
+            if (!connected || !kwsEngine.isProcessReady()
+                    || (lockedSession != null && !lockedSession.shouldAllowHttpReflexSync())) {
+                return;
+            }
+            String currentHash = kwsEngine.getCurrentKeywordsHash();
+            if (table.hash.equals(currentHash)) {
+                // On-disk kw.txt already matches Core, but in-memory retreatWordSet resets on app restart:
+                // perform O(1) in-memory sync with zero disk I/O and zero JNI reload.
+                kwsEngine.setRetreatWords(table.retreatWords);
+                NorthboundSession s = activeSession;
+                if (s != null) {
+                    s.syncLocalKwsMetadata(currentHash, table.wakeWords, table.retreatWords);
+                }
+                return;
+            }
+            if (table.hash.equals(lastFailedReflexSyncHash)) {
+                return;
+            }
+            LocalKwsEngine.ValidationResult vr = kwsEngine.deployKeywords(
+                    table.compiledKeywordsTxt,
+                    table.retreatWords,
+                    config.getKwsThreshold(),
+                    config.getKwsScore());
+            if (vr.valid) {
+                lastFailedReflexSyncHash = "";
+                NorthboundSession s = activeSession;
+                if (s != null) {
+                    s.syncLocalKwsMetadata(kwsEngine.getCurrentKeywordsHash(), table.wakeWords, table.retreatWords);
+                }
+                appendLog("KWS", "Synced " + vr.keywordCount + " reflex word(s) from Core (hash=" + table.hash + ")");
+            } else {
+                lastFailedReflexSyncHash = table.hash;
+                appendLog("KWS", "Skipped Core reflex sync (" + vr.detail + ")");
+            }
+        }
+    }
+
     public void refreshCoreSnapshotNow() {
+        final long epoch = transcriptState.getCoreSwitchEpoch();
+        final long tEpoch = transcriptState.getTranscriptEpoch();
+        final String host = config.getCoreHost();
+        final int webPort = config.getWebPort();
+        final boolean manageOnly = config.isManageOnly();
+        final String devId = resolveEffectiveDeviceId();
+        final String token = config.getBearerToken();
+        final String expectedCoreId = config.getActiveCoreId();
         sendAsync(new Runnable() {
             @Override
             public void run() {
                 CoreApiClient.CoreSnapshot snap = CoreApiClient.fetchSnapshot(
-                        config.getCoreHost(), config.getWebPort(), config.getDeviceId(),
-                        config.getBearerToken(), true);
-                if (snap != null) {
-                    coreSnapshot = snap;
+                        host, webPort, devId, token, true,
+                        DeviceRoutingPolicy.allowSiblingMediaFallback(manageOnly),
+                        expectedCoreId);
+                CoreApiClient.CoreSnapshot committed = transcriptState.commitPolledSnapshot(
+                        host, epoch, tEpoch, manageOnly, true, snap);
+                if (committed != null) {
+                    syncReflexTableFromSnapshot(committed);
                     syncHardwareAndMedia();
                     notifyUi();
                 }
@@ -671,21 +1058,37 @@ public final class GatewayService extends Service {
             final Boolean wakeAck,
             final String wakeArbitration,
             final ModeApplyCallback callback) {
+        final long epoch = transcriptState.getCoreSwitchEpoch();
+        final String host = config.getCoreHost();
+        final int webPort = config.getWebPort();
+        final boolean manageOnly = config.isManageOnly();
+        final String token = config.getBearerToken();
+        final String expectedCoreId = config.getActiveCoreId();
         sendAsync(new Runnable() {
             @Override
             public void run() {
                 String targetDev = resolveEffectiveDeviceId();
-                boolean ok = CoreApiClient.updateDeviceMode(
-                        config.getCoreHost(), config.getWebPort(), targetDev,
-                        duplex, bargeIn, wakeAck, wakeArbitration, config.getBearerToken());
-                if (ok) {
-                    coreSnapshot = CoreApiClient.fetchSnapshot(
-                            config.getCoreHost(), config.getWebPort(), targetDev,
-                            config.getBearerToken(), true);
-                    notifyUi();
+                CoreApiClient.ActionOutcome outcome = CoreApiClient.updateDeviceModeWithResult(
+                        host, webPort, targetDev,
+                        duplex, bargeIn, wakeAck, wakeArbitration, token);
+                boolean ok = outcome.ok;
+                if (outcome.authRequired) {
+                    noteApiAuthFailure(host, true, epoch, false);
+                } else if (ok && transcriptState.getCoreSwitchEpoch() == epoch) {
+                    apiAuthRequired = false;
+                    long tEpoch = transcriptState.getTranscriptEpoch();
+                    CoreApiClient.CoreSnapshot refreshed = CoreApiClient.fetchSnapshot(
+                            host, webPort, targetDev, token, true,
+                            DeviceRoutingPolicy.allowSiblingMediaFallback(manageOnly),
+                            expectedCoreId);
+                    CoreApiClient.CoreSnapshot committed = transcriptState.commitPolledSnapshot(
+                            host, epoch, tEpoch, manageOnly, true, refreshed);
+                    if (committed != null) {
+                        notifyUi();
+                    }
                 }
                 if (callback != null) {
-                    callback.onModeApplied(ok);
+                    callback.onModeApplied(ok, outcome.authRequired);
                 }
             }
         });
@@ -740,12 +1143,35 @@ public final class GatewayService extends Service {
         sendUtteranceInternal(text, "android_media_session", false);
     }
 
+    private static String mapMediaCommandToAction(String clean) {
+        if ("暂停播放".equals(clean) || "暂停".equals(clean)) return "pause";
+        if ("继续播放".equals(clean) || "继续".equals(clean)) return "resume";
+        if ("下一首".equals(clean)) return "next";
+        if ("上一首".equals(clean)) return "previous";
+        if ("停止播放".equals(clean)) return "stop";
+        return null;
+    }
+
     private void sendUtteranceInternal(final String text, final String source, final boolean prependWake) {
         if (text == null || text.trim().isEmpty()) {
             return;
         }
         final String clean = text.trim();
-        lastActionSubtitle = clean;
+        final String host = config.getCoreHost();
+        final int webPort = config.getWebPort();
+        final String token = config.getBearerToken();
+        final boolean manageOnly = config.isManageOnly();
+        final long epoch = transcriptState.getCoreSwitchEpoch();
+        final String directAction = "android_media_session".equals(source)
+                ? mapMediaCommandToAction(clean) : null;
+        if (!manageOnly && (activeSession == null || !connected)) {
+            String errMsg = I18n.t(config.getLanguage(), "voice_disconnected_reconnect");
+            lastTransientError = errMsg;
+            appendLog("CHAT", "Blocked unbound HTTP fallback while Voice Gateway disconnected (" + source + ")");
+            syncHardwareAndMedia();
+            notifyUi();
+            return;
+        }
         if (prependWake) {
             assistantState = "thinking";
         }
@@ -755,24 +1181,99 @@ public final class GatewayService extends Service {
             @Override
             public void run() {
                 NorthboundSession s = activeSession;
-                if (s != null && connected) {
+                DeviceRoutingPolicy.UtteranceRoute route = DeviceRoutingPolicy.resolveUtteranceRoute(
+                        manageOnly, s != null && connected, directAction != null);
+                if (route == DeviceRoutingPolicy.UtteranceRoute.NORTHBOUND_SESSION) {
                     try {
                         s.sendUtterance(clean, source, prependWake);
+                        if (prependWake) {
+                            transcriptState.appendLocalVoiceTurn(host, "user", clean, epoch, false);
+                            notifyUi();
+                        }
                         return;
                     } catch (IOException e) {
-                        appendLog("ERR", "sendUtterance failed: " + e.getMessage());
+                        appendLog("ERR", "sendUtterance failed on Voice Gateway (no /api/v0/chat fallback): " + e.getMessage());
+                        if (transcriptState.getCoreSwitchEpoch() == epoch) {
+                            String errMsg = I18n.t(config.getLanguage(), "voice_disconnected_reconnect");
+                            lastTransientError = errMsg;
+                            if ("thinking".equalsIgnoreCase(assistantState)) {
+                                assistantState = "idle";
+                            }
+                            syncHardwareAndMedia();
+                            notifyUi();
+                        }
+                        return;
                     }
                 }
-                CoreApiClient.sendChatText(
-                        config.getCoreHost(), config.getWebPort(), resolveEffectiveDeviceId(),
-                        config.getBearerToken(), clean);
-                // In Manage-Only mode (:8932 absent), no assistant_state frame will arrive; reset cleanly & refresh snapshot
-                if (!connected && "thinking".equalsIgnoreCase(assistantState)) {
-                    assistantState = "idle";
-                    syncHardwareAndMedia();
-                    notifyUi();
+                if (route == DeviceRoutingPolicy.UtteranceRoute.REJECT_VOICE_DISCONNECTED) {
+                    appendLog("CHAT", "Voice Gateway disconnected; refused unbound HTTP /api/v0/chat fallback");
+                    if (transcriptState.getCoreSwitchEpoch() == epoch) {
+                        String errMsg = I18n.t(config.getLanguage(), "voice_disconnected_reconnect");
+                        lastTransientError = errMsg;
+                        if ("thinking".equalsIgnoreCase(assistantState)) {
+                            assistantState = "idle";
+                        }
+                        syncHardwareAndMedia();
+                        notifyUi();
+                    }
+                    return;
                 }
-                refreshCoreSnapshotNow();
+                if (route == DeviceRoutingPolicy.UtteranceRoute.MANAGE_ONLY_MEDIA_CONTROL) {
+                    CoreApiClient.ActionOutcome mediaOutcome = CoreApiClient.controlRemoteMediaWithResult(
+                            host, webPort, resolveEffectiveDeviceId(), directAction, token);
+                    if (mediaOutcome.authRequired) {
+                        noteApiAuthFailure(host, true, epoch, true);
+                    }
+                    refreshCoreSnapshotNow();
+                    return;
+                }
+                // P1-1: Atomically record the user turn, read manageOnlySessionIds, and capture
+                // transcriptEpoch BEFORE calling sendChatTextWithReply so a concurrent Clear
+                // cleanly discards the stale in-flight SSE reply & reply.sessionId.
+                TranscriptStateStore.ManageSendTicket ticket =
+                        transcriptState.beginManageOnlyChatTurn(host, clean, epoch, true);
+                if (!ticket.accepted) {
+                    return;
+                }
+                notifyUi();
+                CoreApiClient.ChatReply reply = CoreApiClient.sendChatTextWithReply(
+                        host, webPort, ticket.prevSessionId, token, clean);
+                if (transcriptState.getCoreSwitchEpoch() == epoch) {
+                    if (reply.authRequired) {
+                        noteApiAuthFailure(host, true, epoch, true);
+                    }
+                    String assistantText = null;
+                    if (reply.hasConfirmation()) {
+                        String lang = config.getLanguage();
+                        assistantText = reply.answerText != null && !reply.answerText.isEmpty()
+                                ? reply.answerText
+                                : (!reply.confirmationSummary.isEmpty()
+                                        ? I18n.t(lang, "confirm_action_pending") + reply.confirmationSummary
+                                        : I18n.t(lang, "confirm_action_pending_generic"));
+                    } else if (reply.answerText != null && !reply.answerText.isEmpty()) {
+                        assistantText = reply.answerText;
+                    } else if (!reply.ok) {
+                        String errText = (reply.error != null && !reply.error.isEmpty()) ? reply.error : "request_failed";
+                        appendLog("CHAT", "Manage-Only chat failed: " + errText);
+                        assistantText = "(" + errText + ")";
+                    }
+                    boolean committed = transcriptState.commitManageOnlyChatReply(
+                            host, epoch, ticket.transcriptEpoch, true, reply.sessionId, assistantText);
+                    if (committed && reply.hasConfirmation()) {
+                        pendingConfirmation = new PendingConfirmation(
+                                host, webPort, reply.confirmationId,
+                                reply.confirmationSummary, reply.confirmationTool,
+                                reply.confirmationState, reply.confirmationRevision);
+                    }
+                    if (!connected && "thinking".equalsIgnoreCase(assistantState)) {
+                        assistantState = "idle";
+                        syncHardwareAndMedia();
+                    }
+                    notifyUi();
+                    if (committed) {
+                        refreshCoreSnapshotNow();
+                    }
+                }
             }
         });
     }
@@ -802,10 +1303,13 @@ public final class GatewayService extends Service {
                         return;
                     }
                     boolean hadCoreBefore = config.hasConfiguredCore();
+                    // Security (P0-1): NEVER pass saved Bearer tokens into unauthenticated LAN scans.
                     List<CoreDiscovery.DiscoveredCore> found = CoreDiscovery.scanLan(
                             config.getCoreHost(), collectSavedCandidateHosts(),
-                            config.getWebPort(), config.getCorePort(), 240);
-                    lastDiscoveredCores = found;
+                            config.getWebPort(), config.getCorePort(), 450);
+                    if (!found.isEmpty() || lastDiscoveredCores.isEmpty()) {
+                        lastDiscoveredCores = found;
+                    }
                     int added = config.mergeDiscoveredCores(found);
                     if (!found.isEmpty()) {
                         appendLog("DISC", "Auto-scan found " + found.size() + " Core(s) (deduped), merged +" + added);
@@ -827,10 +1331,29 @@ public final class GatewayService extends Service {
             @Override
             public void run() {
                 boolean hadCoreBefore = config.hasConfiguredCore();
+                List<String> savedHosts = collectSavedCandidateHosts();
+                String activeHost = config.getCoreHost();
+                // Security (P0-1): NEVER pass saved Bearer tokens into unauthenticated LAN scans.
                 List<CoreDiscovery.DiscoveredCore> found = CoreDiscovery.scanLan(
-                        config.getCoreHost(), collectSavedCandidateHosts(),
-                        config.getWebPort(), config.getCorePort(), 240);
-                lastDiscoveredCores = found;
+                        activeHost, savedHosts,
+                        config.getWebPort(), config.getCorePort(), 450);
+                if (found.isEmpty()) {
+                    List<String> fallbackHosts = new java.util.ArrayList<String>(savedHosts);
+                    if (activeHost != null && !activeHost.trim().isEmpty()) {
+                        fallbackHosts.add(0, activeHost.trim());
+                    }
+                    if (!fallbackHosts.isEmpty()) {
+                        List<CoreDiscovery.DiscoveredCore> fallbackFound =
+                                CoreDiscovery.probeSavedHostsWithFleetFallback(
+                                        fallbackHosts, config.getWebPort(), config.getCorePort(), 5000);
+                        if (!fallbackFound.isEmpty()) {
+                            found = fallbackFound;
+                        }
+                    }
+                }
+                if (!found.isEmpty() || lastDiscoveredCores.isEmpty()) {
+                    lastDiscoveredCores = found;
+                }
                 int added = config.mergeDiscoveredCores(found);
                 if (!found.isEmpty()) {
                     CoreDiscovery.DiscoveredCore best = found.get(0);
@@ -838,7 +1361,8 @@ public final class GatewayService extends Service {
                     if (autoBindFirst || (!hadCoreBefore && config.hasConfiguredCore())) {
                         config.upsertProfileAndSelect(
                                 best.displayLabel(), best.host, best.gatewayPort, best.webPort,
-                                null, best.coreId, best.alternateHosts);
+                                null, best.coreId, best.alternateHosts,
+                                Boolean.valueOf(!best.voiceGatewayOpen));
                         reloadConfigAndReconnect();
                     }
                 }
@@ -892,42 +1416,15 @@ public final class GatewayService extends Service {
                     }
                     return;
                 }
-                ExecutorService pool = Executors.newFixedThreadPool(Math.max(1, Math.min(6, targets.size())));
-                List<java.util.concurrent.Future<CoreApiClient.RoomNodeSummary>> futures =
-                        new java.util.ArrayList<java.util.concurrent.Future<CoreApiClient.RoomNodeSummary>>();
-                for (final GatewayConfig.ServerProfile p : targets.values()) {
-                    futures.add(pool.submit(new java.util.concurrent.Callable<CoreApiClient.RoomNodeSummary>() {
-                        @Override
-                        public CoreApiClient.RoomNodeSummary call() {
-                            String tok = !p.bearerToken.isEmpty() ? p.bearerToken : config.getBearerTokenForHost(p.host);
-                            CoreApiClient.RoomNodeSummary primary = CoreApiClient.fetchRoomSummary(
-                                    p.host, p.webPort, p.gatewayPort, p.name, tok);
-                            if (primary.online || p.alternateHosts.isEmpty()) {
-                                return primary;
-                            }
-                            // Try fallback routes (e.g. Tailscale) for the same logical Core
-                            for (String alt : p.alternateHosts) {
-                                CoreApiClient.RoomNodeSummary fallback = CoreApiClient.fetchRoomSummary(
-                                        alt, p.webPort, p.gatewayPort, p.name, tok);
-                                if (fallback.online) {
-                                    return fallback;
-                                }
-                            }
-                            return primary;
-                        }
-                    }));
+                List<CoreApiClient.RoomTarget> roomTargets =
+                        new java.util.ArrayList<CoreApiClient.RoomTarget>(targets.size());
+                for (GatewayConfig.ServerProfile p : targets.values()) {
+                    String tok = !p.bearerToken.isEmpty() ? p.bearerToken : config.getBearerTokenForHost(p.host);
+                    roomTargets.add(new CoreApiClient.RoomTarget(
+                            p.host, p.webPort, p.gatewayPort, p.name, tok, p.coreId, p.alternateHosts));
                 }
-                List<CoreApiClient.RoomNodeSummary> results = new java.util.ArrayList<CoreApiClient.RoomNodeSummary>();
-                for (java.util.concurrent.Future<CoreApiClient.RoomNodeSummary> f : futures) {
-                    try {
-                        CoreApiClient.RoomNodeSummary s = f.get(3000L, TimeUnit.MILLISECONDS);
-                        if (s != null) {
-                            results.add(s);
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                }
-                pool.shutdownNow();
+                List<CoreApiClient.RoomNodeSummary> results =
+                        CoreApiClient.fetchRoomSummariesConcurrently(roomTargets, 5500L);
                 if (callback != null) {
                     callback.onRoomSummaries(results);
                 }
@@ -940,9 +1437,12 @@ public final class GatewayService extends Service {
         sendAsync(new Runnable() {
             @Override
             public void run() {
-                boolean ok = CoreApiClient.sendChatText(
-                        host, webPort, config.getDeviceId(), config.getBearerTokenForHost(host), text);
-                if (callback != null) callback.onActionDone(ok);
+                CoreApiClient.ChatReply reply = CoreApiClient.sendChatTextWithReply(
+                        host, webPort, null, config.getBearerTokenForHost(host), text);
+                if (reply.authRequired) {
+                    noteApiAuthFailure(host, true, -1L, false);
+                }
+                if (callback != null) callback.onActionDone(reply.ok, reply.authRequired);
             }
         });
     }
@@ -953,24 +1453,36 @@ public final class GatewayService extends Service {
             @Override
             public void run() {
                 String tok = config.getBearerTokenForHost(host);
-                boolean ok = (deviceId != null && !deviceId.isEmpty())
-                        ? CoreApiClient.stopRemoteDevice(host, webPort, deviceId, tok)
-                        : CoreApiClient.sendChatText(host, webPort, config.getDeviceId(), tok, "停止播放");
-                if (callback != null) callback.onActionDone(ok);
+                // MG-P0-01/02: require an explicit target deviceId for remote HTTP stop;
+                // never fall back to unbound POST /api/v0/chat.
+                CoreApiClient.ActionOutcome outcome = (deviceId != null && !deviceId.isEmpty())
+                        ? CoreApiClient.stopRemoteDeviceWithResult(host, webPort, deviceId, tok)
+                        : CoreApiClient.ActionOutcome.failure(0);
+                if (outcome.authRequired) {
+                    noteApiAuthFailure(host, true, -1L, false);
+                }
+                if (callback != null) callback.onActionDone(outcome.ok, outcome.authRequired);
             }
         });
     }
 
-    public void pauseRemoteRoomAsync(
-            final String host, final int webPort, final String deviceId, final ActionResultCallback callback) {
+    public void controlRemoteRoomMediaAsync(
+            final String host,
+            final int webPort,
+            final String deviceId,
+            final String action,
+            final ActionResultCallback callback) {
         sendAsync(new Runnable() {
             @Override
             public void run() {
                 String tok = config.getBearerTokenForHost(host);
-                boolean ok = (deviceId != null && !deviceId.isEmpty())
-                        ? CoreApiClient.pauseRemoteDevice(host, webPort, deviceId, tok)
-                        : CoreApiClient.sendChatText(host, webPort, config.getDeviceId(), tok, "暂停播放");
-                if (callback != null) callback.onActionDone(ok);
+                CoreApiClient.ActionOutcome outcome = (deviceId != null && !deviceId.isEmpty())
+                        ? CoreApiClient.controlRemoteMediaWithResult(host, webPort, deviceId, action, tok)
+                        : CoreApiClient.ActionOutcome.failure(0);
+                if (outcome.authRequired) {
+                    noteApiAuthFailure(host, true, -1L, false);
+                }
+                if (callback != null) callback.onActionDone(outcome.ok, outcome.authRequired);
             }
         });
     }
@@ -982,28 +1494,34 @@ public final class GatewayService extends Service {
             @Override
             public void run() {
                 String tok = config.getBearerTokenForHost(host);
-                boolean ok = (deviceId != null && !deviceId.isEmpty())
-                        ? CoreApiClient.setRemoteDeviceVolume(host, webPort, deviceId, linearVol, tok)
-                        : false;
-                if (callback != null) callback.onActionDone(ok);
+                CoreApiClient.ActionOutcome outcome = (deviceId != null && !deviceId.isEmpty())
+                        ? CoreApiClient.setRemoteDeviceVolumeWithResult(host, webPort, deviceId, linearVol, tok)
+                        : CoreApiClient.ActionOutcome.failure(0);
+                if (outcome.authRequired) {
+                    noteApiAuthFailure(host, true, -1L, false);
+                }
+                if (callback != null) callback.onActionDone(outcome.ok, outcome.authRequired);
             }
         });
     }
 
     public void triggerManualWake(final String keyword) {
+        final NorthboundSession s = activeSession;
+        if (s == null || !connected) {
+            return;
+        }
         final long now = System.currentTimeMillis();
-        lastActionSubtitle = keyword;
         assistantState = "listening";
         syncHardwareAndMedia();
         notifyUi();
         sendAsync(new Runnable() {
             @Override
             public void run() {
-                NorthboundSession s = activeSession;
-                if (s != null && connected) {
+                NorthboundSession cur = activeSession;
+                if (cur != null && connected) {
                     try {
-                        s.notifyWakeForUplinkAndFlushPreroll(now);
-                        s.sendWake(keyword, 3.20, "touch");
+                        cur.sendWake(keyword, 3.20, "touch");
+                        cur.notifyWakeForUplinkAndFlushPreroll(now);
                     } catch (IOException e) {
                         appendLog("ERR", "sendWake failed: " + e.getMessage());
                     }
@@ -1012,12 +1530,227 @@ public final class GatewayService extends Service {
         });
     }
 
-    public void triggerManualRetreat(final String keyword) {
+    public void fetchConversationHistoryNowAsync(final HistoryCallback callback) {
+        final long epoch = transcriptState.getCoreSwitchEpoch();
+        final long tEpoch = transcriptState.getTranscriptEpoch();
+        final String host = config.getCoreHost();
+        final int webPort = config.getWebPort();
+        final boolean manageOnly = config.isManageOnly();
+        final String token = config.getBearerToken();
+        final String targetDev = resolveEffectiveDeviceId();
+        final CoreApiClient.CoreSnapshot snapAtCall = transcriptState.getSnapshot();
+        sendAsync(new Runnable() {
+            @Override
+            public void run() {
+                if (host == null || host.isEmpty()) {
+                    if (callback != null) {
+                        callback.onHistoryLoaded(
+                                java.util.Collections.<CoreApiClient.ChatEntry>emptyList(), "", false, false);
+                    }
+                    return;
+                }
+                String resolvedDev = targetDev;
+                CoreApiClient.ConversationHistoryResult res =
+                        CoreApiClient.fetchConversationHistory(host, webPort, targetDev, token);
+
+                // In Manage-Only mode ONLY, if initial device has 0 messages, try first online device
+                if (manageOnly && res.ok && res.messages.isEmpty()) {
+                    String fallbackDev = "";
+                    if (snapAtCall != null && snapAtCall.devices != null) {
+                        for (CoreApiClient.DeviceInfo d : snapAtCall.devices) {
+                            if (d != null && d.connected && d.id != null && !d.id.isEmpty()
+                                    && !d.id.equals(targetDev)) {
+                                fallbackDev = d.id;
+                                break;
+                            }
+                        }
+                    }
+                    if (!fallbackDev.isEmpty()) {
+                        CoreApiClient.ConversationHistoryResult alt =
+                                CoreApiClient.fetchConversationHistory(host, webPort, fallbackDev, token);
+                        if (alt.authRequired || (alt.ok && !alt.messages.isEmpty())) {
+                            res = alt;
+                            resolvedDev = fallbackDev;
+                        }
+                    }
+                }
+
+                if (res.authRequired) {
+                    noteApiAuthFailure(host, true, epoch, false);
+                }
+
+                TranscriptStateStore.HistoryCommitResult hRes = transcriptState.commitConversationHistory(
+                        host, epoch, tEpoch, manageOnly, resolvedDev, res);
+                if (res.ok && hRes.fresh) {
+                    notifyUi();
+                }
+                if (callback != null) {
+                    callback.onHistoryLoaded(
+                            hRes.merged,
+                            hRes.currentSessionId,
+                            res.authRequired,
+                            res.ok && hRes.fresh);
+                }
+            }
+        });
+    }
+
+    public void clearActiveConversationAsync(
+            final String expectedSessionId,
+            final ActionResultCallback callback) {
+        clearActiveConversationAsync(expectedSessionId, true, callback);
+    }
+
+    public void clearActiveConversationAsync(
+            final String expectedSessionId,
+            final boolean includeArchived,
+            final ActionResultCallback callback) {
+        final long epoch = transcriptState.getCoreSwitchEpoch();
+        final String host = config.getCoreHost();
+        final int webPort = config.getWebPort();
+        final String token = config.getBearerToken();
+        final String pinnedDev = transcriptState.getLastHistoryDeviceId();
+        final String targetDev = (pinnedDev != null && !pinnedDev.isEmpty())
+                ? pinnedDev
+                : resolveEffectiveDeviceId();
+        sendAsync(new Runnable() {
+            @Override
+            public void run() {
+                String sid = expectedSessionId != null ? expectedSessionId.trim() : "";
+                boolean ok;
+                boolean authRequired = false;
+                if (host == null || host.isEmpty() || targetDev == null || targetDev.isEmpty()) {
+                    ok = true;
+                } else {
+                    // If the UI did not yet have a session_id (e.g., cleared before initial
+                    // history fetch finished), resolve the live head from Core first so the
+                    // optimistic lock succeeds when a Core session exists.
+                    if (sid.isEmpty()) {
+                        CoreApiClient.ConversationHistoryResult probe =
+                                CoreApiClient.fetchConversationHistory(host, webPort, targetDev, token);
+                        if (probe.authRequired) {
+                            noteApiAuthFailure(host, true, epoch, false);
+                            if (callback != null) {
+                                callback.onActionDone(false, true);
+                            }
+                            return;
+                        }
+                        if (probe.ok && probe.currentSessionId != null && !probe.currentSessionId.trim().isEmpty()) {
+                            sid = probe.currentSessionId.trim();
+                        } else if (!probe.ok && !transcriptState.isLastRawServerTranscriptEmpty()) {
+                            if (callback != null) {
+                                callback.onActionDone(false, false);
+                            }
+                            return;
+                        }
+                    }
+
+                    if (sid.isEmpty() && transcriptState.isLastRawServerTranscriptEmpty()) {
+                        // Local-only cached turns with no server session on Core.
+                        ok = true;
+                    } else {
+                        CoreApiClient.ActionOutcome outcome = CoreApiClient.clearDeviceConversation(
+                                host, webPort, targetDev, sid, includeArchived, token);
+                        authRequired = outcome.authRequired;
+                        if (outcome.authRequired) {
+                            noteApiAuthFailure(host, true, epoch, false);
+                        }
+                        ok = outcome.ok;
+                    }
+                }
+                boolean cleared = ok && transcriptState.clearConversation(host, epoch);
+                if (cleared) {
+                    pendingConfirmation = null;
+                    notifyUi();
+                    refreshCoreSnapshotNow();
+                }
+                if (callback != null) {
+                    callback.onActionDone(cleared, authRequired);
+                }
+            }
+        });
+    }
+
+    public void verifyRoomTokenAsync(
+            final String host,
+            final int webPort,
+            final String rawToken,
+            final TokenVerifyCallback callback) {
+        sendAsync(new Runnable() {
+            @Override
+            public void run() {
+                String clean = CoreApiClient.sanitizeBearerToken(rawToken);
+                CoreApiClient.TokenVerifyResult result = CoreApiClient.verifyBearerTokenWithIdentity(host, webPort, clean);
+                if (callback != null) {
+                    callback.onTokenVerified(result, clean);
+                }
+            }
+        });
+    }
+
+    /**
+     * Resolve a wake keyword guaranteed to match the active Core's reflex table
+     * (preferring "你好小智" when present, else first configured wake word, else "你好小智").
+     */
+    public String resolvePreferredWakeKeyword() {
+        List<String> candidates = new java.util.ArrayList<String>();
+        CoreApiClient.CoreSnapshot snap = transcriptState.getSnapshot();
+        if (snap != null && snap.reflexTable != null && snap.reflexTable.wakeWords != null) {
+            candidates.addAll(snap.reflexTable.wakeWords);
+        }
+        if (candidates.isEmpty()) {
+            NorthboundSession s = activeSession;
+            if (s != null) {
+                candidates.addAll(s.getWakeKeywordsSnapshot());
+            }
+        }
+        if (candidates.contains("你好小智")) {
+            return "你好小智";
+        }
+        for (String c : candidates) {
+            if (c != null && !c.trim().isEmpty()) {
+                return c.trim();
+            }
+        }
+        return "你好小智";
+    }
+
+    /**
+     * Resolve a retreat keyword that is guaranteed to exist in the active Core's
+     * reflex table (preferring "退下吧", then "停止播放", then first configured retreat word).
+     */
+    public String resolvePreferredRetreatKeyword() {
+        List<String> candidates = new java.util.ArrayList<String>();
+        NorthboundSession s = activeSession;
+        if (s != null) {
+            candidates.addAll(s.getRetreatKeywordsSnapshot());
+        }
+        CoreApiClient.CoreSnapshot snap = transcriptState.getSnapshot();
+        if (candidates.isEmpty() && snap != null && snap.reflexTable != null && snap.reflexTable.retreatWords != null) {
+            candidates.addAll(snap.reflexTable.retreatWords);
+        }
+        if (candidates.contains("退下吧")) {
+            return "退下吧";
+        }
+        if (candidates.contains("停止播放")) {
+            return "停止播放";
+        }
+        for (String c : candidates) {
+            if (c != null && !c.trim().isEmpty()) {
+                return c.trim();
+            }
+        }
+        return "退下吧";
+    }
+
+    public void triggerManualRetreat(final String requestedKeyword) {
+        final String keyword = (requestedKeyword != null && !requestedKeyword.trim().isEmpty())
+                ? requestedKeyword.trim()
+                : resolvePreferredRetreatKeyword();
         final long t0 = System.currentTimeMillis();
         final List<String> flushed = audioEngine.stopAndFlush();
         final long latencyMs = Math.max(1L, System.currentTimeMillis() - t0);
         acousticGuard.onPlaybackStopped();
-        lastActionSubtitle = keyword;
         assistantState = "idle";
         syncHardwareAndMedia();
         notifyUi();
@@ -1037,11 +1770,18 @@ public final class GatewayService extends Service {
     }
 
     public void toggleMute() {
+        final boolean nextMuted = !isMuted();
+        desiredMuted = nextMuted;
+        config.setDesiredMuted(nextMuted);
         final NorthboundSession s = activeSession;
-        if (s == null) {
+        if (s == null || !connected) {
+            if (s != null) {
+                s.setInitialMuted(nextMuted);
+            }
+            syncHardwareAndMedia();
+            notifyUi();
             return;
         }
-        final boolean nextMuted = !s.isMuted();
         sendAsync(new Runnable() {
             @Override
             public void run() {
@@ -1077,12 +1817,14 @@ public final class GatewayService extends Service {
             hardwareAdapter.syncAssistantLedState(assistantState, isMuted(), connected);
         }
         if (mediaSessionController != null) {
-            boolean mediaPlaying = audioEngine.hasActiveMediaPlayback() || coreSnapshot.musicActive;
-            String title = coreSnapshot.musicTitle != null && !coreSnapshot.musicTitle.isEmpty()
-                    ? coreSnapshot.musicTitle
+            CoreApiClient.CoreSnapshot snap = transcriptState.getSnapshot();
+            boolean mediaPlaying = audioEngine.hasActiveMediaPlayback()
+                    || ((connected || config.isManageOnly()) && snap != null && snap.musicActive);
+            String title = snap != null && snap.musicTitle != null && !snap.musicTitle.isEmpty()
+                    ? snap.musicTitle
                     : config.getRoomName();
-            String sub = coreSnapshot.assistantName != null && !coreSnapshot.assistantName.isEmpty()
-                    ? coreSnapshot.assistantName
+            String sub = snap != null && snap.assistantName != null && !snap.assistantName.isEmpty()
+                    ? snap.assistantName
                     : "Home Mate";
             mediaSessionController.updatePlaybackState(mediaPlaying, title, sub);
         }
@@ -1172,19 +1914,21 @@ public final class GatewayService extends Service {
                 public void run() {
                     List<GatewayConfig.ServerProfile> profiles = config.getServerProfiles();
                     // 1. Prioritize RFC1918 LAN routes on the CURRENTLY ACTIVE profile first
+                    // Security (P0-1): require pinned coreId and verify /api/v0/auth BEFORE transmitting bearerToken.
                     for (GatewayConfig.ServerProfile p : profiles) {
-                        if (!p.matchesHost(activeHostNow)) {
+                        if (!p.matchesHost(activeHostNow) || p.coreId.isEmpty()) {
                             continue;
                         }
                         for (String candidate : p.allCandidateHosts()) {
                             if (CoreDiscovery.isRfc1918PrivateIp(candidate)) {
                                 CoreDiscovery.DiscoveredCore probed = CoreDiscovery.probeHost(
-                                        candidate, p.webPort, p.gatewayPort, 900);
-                                if (probed != null && probed.voiceGatewayOpen) {
-                                    appendLog("NET", "Wi-Fi LAN route on active Core available; failing back to " + candidate);
+                                        candidate, p.webPort, p.gatewayPort, 900, p.bearerToken, p.coreId);
+                                if (probed != null && probed.voiceGatewayOpen
+                                        && probed.coreId.equalsIgnoreCase(p.coreId)) {
+                                    appendLog("NET", "Wi-Fi LAN route on active Core verified; failing back to " + candidate);
                                     config.upsertProfileAndSelect(
                                             p.name, candidate, probed.gatewayPort, p.webPort,
-                                            p.bearerToken, !probed.coreId.isEmpty() ? probed.coreId : p.coreId,
+                                            p.bearerToken, p.coreId,
                                             p.allCandidateHosts());
                                     reloadConfigAndReconnect();
                                     return;
@@ -1192,20 +1936,21 @@ public final class GatewayService extends Service {
                             }
                         }
                     }
-                    // 2. Fallback: scan other saved profiles' LAN routes
+                    // 2. Fallback: scan other saved profiles' LAN routes (only with pinned coreId verification)
                     for (GatewayConfig.ServerProfile p : profiles) {
-                        if (p.matchesHost(activeHostNow)) {
+                        if (p.matchesHost(activeHostNow) || p.coreId.isEmpty()) {
                             continue;
                         }
                         for (String candidate : p.allCandidateHosts()) {
                             if (CoreDiscovery.isRfc1918PrivateIp(candidate)) {
                                 CoreDiscovery.DiscoveredCore probed = CoreDiscovery.probeHost(
-                                        candidate, p.webPort, p.gatewayPort, 900);
-                                if (probed != null && probed.voiceGatewayOpen) {
-                                    appendLog("NET", "Wi-Fi LAN Core available; failing back to " + candidate);
+                                        candidate, p.webPort, p.gatewayPort, 900, p.bearerToken, p.coreId);
+                                if (probed != null && probed.voiceGatewayOpen
+                                        && probed.coreId.equalsIgnoreCase(p.coreId)) {
+                                    appendLog("NET", "Wi-Fi LAN Core verified; failing back to " + candidate);
                                     config.upsertProfileAndSelect(
                                             p.name, candidate, probed.gatewayPort, p.webPort,
-                                            p.bearerToken, !probed.coreId.isEmpty() ? probed.coreId : p.coreId,
+                                            p.bearerToken, p.coreId,
                                             p.allCandidateHosts());
                                     reloadConfigAndReconnect();
                                     return;
@@ -1224,8 +1969,14 @@ public final class GatewayService extends Service {
         }
         serviceRunning = true;
         audioEngine.configure(config.isUseVoiceCommAec(), config.isSoftwareAecEnabled(), config.getUplinkGain());
-        if (hasRecordAudioPermission()) {
+        if (canStartLiveMicCapture()) {
+            captureStartedWhileBootRestricted = false;
             audioEngine.startCapture();
+        } else if (hasRecordAudioPermission()) {
+            // P1-4: On Android 11-14 boot-restricted FGS, do NOT open a silenced AudioRecord
+            // before foreground FGS upgrades to FOREGROUND_SERVICE_TYPE_MICROPHONE.
+            captureStartedWhileBootRestricted = false;
+            appendLog("FGS", "Boot-restricted FGS active; deferring AudioRecord until MICROPHONE upgrade");
         } else {
             appendLog("PERM", "Waiting for RECORD_AUDIO permission");
         }
@@ -1247,6 +1998,8 @@ public final class GatewayService extends Service {
         }, "hm-core-api-poll");
         apiPollThread.setDaemon(true);
         apiPollThread.start();
+
+        triggerAutoLanDiscoveryIfNeeded(false);
     }
 
     private synchronized void stopGatewayLoop() {
@@ -1282,27 +2035,31 @@ public final class GatewayService extends Service {
         int pollCount = 0;
         while (serviceRunning && !Thread.currentThread().isInterrupted()) {
             try {
+                // Keep TX write-stall watchdog alive even when AudioRecord capture is paused/restricted
+                TwoTierOutboundTransport tx = activeTxTransport;
+                if (tx != null) {
+                    tx.checkWriteStall();
+                }
                 if (uiForeground || audioEngine.hasActiveMediaPlayback()) {
                     boolean fullFetch = (pollCount % 3 == 0);
                     pollCount++;
-                    CoreApiClient.CoreSnapshot prev = coreSnapshot;
+                    final long pollEpoch = transcriptState.getCoreSwitchEpoch();
+                    final long pollTranscriptEpoch = transcriptState.getTranscriptEpoch();
+                    final String pollHost = config.getCoreHost();
+                    final int pollWebPort = config.getWebPort();
+                    final String pollToken = config.getBearerToken();
+                    final String pollExpectedCoreId = config.getActiveCoreId();
+                    boolean pollManageOnly = config.isManageOnly();
                     String pollDevId = resolveEffectiveDeviceId();
                     CoreApiClient.CoreSnapshot snap = CoreApiClient.fetchSnapshot(
-                            config.getCoreHost(), config.getWebPort(), pollDevId,
-                            config.getBearerToken(), fullFetch);
-                    if (snap != null) {
-                        if (!fullFetch && snap.reachable && !snap.authRequired && prev != null && prev.reachable) {
-                            // Preserve cached devices/fleet/assistantName (and non-empty Manage-Only transcript) on lightweight polls
-                            List<CoreApiClient.ChatEntry> txEntries = (snap.transcript != null && !snap.transcript.isEmpty())
-                                    ? snap.transcript : prev.transcript;
-                            snap = new CoreApiClient.CoreSnapshot(
-                                    snap.reachable, snap.authRequired,
-                                    prev.assistantName, prev.buildId,
-                                    snap.duplexMode, snap.bargeIn, snap.wakeAckEnabled, snap.wakeArbitration,
-                                    snap.musicActive, snap.musicTitle, snap.musicSource,
-                                    prev.devices, prev.fleetNodes, txEntries, snap.error);
-                        }
-                        coreSnapshot = snap;
+                            pollHost, pollWebPort, pollDevId,
+                            pollToken, fullFetch,
+                            DeviceRoutingPolicy.allowSiblingMediaFallback(pollManageOnly),
+                            pollExpectedCoreId);
+                    CoreApiClient.CoreSnapshot committed = transcriptState.commitPolledSnapshot(
+                            pollHost, pollEpoch, pollTranscriptEpoch, pollManageOnly, fullFetch, snap);
+                    if (committed != null) {
+                        syncReflexTableFromSnapshot(committed);
                         syncHardwareAndMedia();
                         notifyUi();
                     }
@@ -1322,37 +2079,45 @@ public final class GatewayService extends Service {
         String currentHost = config.getCoreHost();
         List<GatewayConfig.ServerProfile> profiles = config.getServerProfiles();
         // 1. First try alternate routes (e.g. Tailscale <-> LAN) on the SAME active Core profile
+        // Security (P0-1): verify /api/v0/auth core_id match before transmitting bearerToken or switching.
         for (GatewayConfig.ServerProfile p : profiles) {
-            if (p.matchesHost(currentHost)) {
+            if (p.matchesHost(currentHost) && !p.coreId.isEmpty()) {
                 for (String alt : p.allCandidateHosts()) {
                     if (alt.equalsIgnoreCase(currentHost)) {
                         continue;
                     }
-                    CoreDiscovery.DiscoveredCore probed = CoreDiscovery.probeHost(alt, p.webPort, p.gatewayPort, 1200);
-                    if (probed != null) {
+                    CoreDiscovery.DiscoveredCore probed = CoreDiscovery.probeHost(
+                            alt, p.webPort, p.gatewayPort, 1200, p.bearerToken, p.coreId);
+                    if (probed != null && probed.coreId.equalsIgnoreCase(p.coreId)) {
                         appendLog("NET", "Route failover on " + p.name + " -> " + alt);
                         config.upsertProfileAndSelect(
                                 p.name, alt, probed.gatewayPort, p.webPort,
-                                p.bearerToken, !probed.coreId.isEmpty() ? probed.coreId : p.coreId,
+                                p.bearerToken, p.coreId,
                                 p.allCandidateHosts());
+                        resetCoreSwitchState();
+                        refreshCoreSnapshotNow();
                         return;
                     }
                 }
             }
         }
-        // 2. Otherwise try other saved Core profiles via HTTP probe only (zero raw :8932 probing)
+        // 2. Otherwise try other saved Core profiles via identity-verified HTTP probe only
         for (GatewayConfig.ServerProfile p : profiles) {
-            if (p.matchesHost(currentHost)) {
+            if (p.matchesHost(currentHost) || p.coreId.isEmpty()) {
                 continue;
             }
             for (String candidate : p.allCandidateHosts()) {
-                CoreDiscovery.DiscoveredCore probed = CoreDiscovery.probeHost(candidate, p.webPort, p.gatewayPort, 1200);
-                if (probed != null && probed.voiceGatewayOpen) {
+                CoreDiscovery.DiscoveredCore probed = CoreDiscovery.probeHost(
+                        candidate, p.webPort, p.gatewayPort, 1200, p.bearerToken, p.coreId);
+                if (probed != null && probed.voiceGatewayOpen
+                        && probed.coreId.equalsIgnoreCase(p.coreId)) {
                     appendLog("NET", "Auto-Failover switched to " + p.name + " (" + candidate + ")");
                     config.upsertProfileAndSelect(
                             p.name, candidate, probed.gatewayPort, p.webPort,
-                            p.bearerToken, !probed.coreId.isEmpty() ? probed.coreId : p.coreId,
+                            p.bearerToken, p.coreId,
                             p.allCandidateHosts());
+                    resetCoreSwitchState();
+                    refreshCoreSnapshotNow();
                     return;
                 }
             }
@@ -1382,15 +2147,40 @@ public final class GatewayService extends Service {
                 continue;
             }
 
+            if (config.isManageOnly()) {
+                connected = false;
+                voiceAuthRequired = false;
+                boolean httpReachable = isHttpManageOnline()
+                        || CoreApiClient.probeCoreHttp(host, config.getWebPort(), config.getActiveCoreId(), 800);
+                if (httpReachable) {
+                    connectionStatus = "Manage · " + host;
+                    updateNotification("Online (Manage) · " + host);
+                } else {
+                    connectionStatus = "Offline (" + host + ")";
+                    updateNotification("Offline · " + host);
+                }
+                syncHardwareAndMedia();
+                notifyUi();
+                try {
+                    Thread.sleep(15_000L);
+                } catch (InterruptedException ignored) {
+                    Thread.interrupted();
+                }
+                continue;
+            }
+
             connected = false;
             connectionStatus = host + ":" + port;
             notifyUi();
 
             boolean skipBackoff = false;
-            boolean manageOnlyCore = false;
             final boolean[] rejectedUnauthorized = new boolean[]{false};
             try (Socket socket = new Socket()) {
                 activeSocket = socket;
+                try {
+                    socket.setReceiveBufferSize(262_144);
+                } catch (Throwable ignored) {
+                }
                 socket.connect(new InetSocketAddress(host, port), 3500);
                 socket.setTcpNoDelay(true);
                 socket.setKeepAlive(true);
@@ -1401,7 +2191,7 @@ public final class GatewayService extends Service {
                 final BufferedWriter writer = new BufferedWriter(
                         new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
                 final BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8), 65536);
 
                 final TwoTierOutboundTransport txTransport = new TwoTierOutboundTransport(socket, writer);
                 activeTxTransport = txTransport;
@@ -1409,13 +2199,15 @@ public final class GatewayService extends Service {
                 NorthboundSession session = new NorthboundSession(
                         deviceId,
                         model,
-                        "2.3.0-android",
+                        NorthboundSession.GATEWAY_VERSION + "-android",
+                        processBootId,
                         txTransport,
                         new NorthboundSession.BaseListener() {
                             @Override
                             public void onHelloAck(long generation, int negotiatedProtocol) {
                                 connected = true;
                                 voiceAuthRequired = false;
+                                lastFailedReflexSyncHash = "";
                                 connectionStatus = host + " · v" + negotiatedProtocol;
                                 updateNotification("Online · " + host);
                                 syncHardwareAndMedia();
@@ -1428,12 +2220,23 @@ public final class GatewayService extends Service {
                                 connected = false;
                                 if ("unauthorized".equalsIgnoreCase(reason)) {
                                     voiceAuthRequired = true;
+                                }
+                                if (NorthboundSession.isBackoffRejectReason(reason)) {
                                     rejectedUnauthorized[0] = true;
                                 }
                                 connectionStatus = "Rejected: " + reason;
                                 appendLog("NET", "hello_reject: " + reason + " (core supports v" + minProtocol + "-v" + maxProtocol + ")");
                                 notifyUi();
                                 closeActiveSocket();
+                            }
+
+                            @Override
+                            public void onModeChanged(String duplexMode, boolean lowLatency) {
+                                NorthboundSession cur = activeSession;
+                                if (cur != null) {
+                                    config.setConfigV2StateJson(cur.exportPersistedConfigStateJson());
+                                }
+                                notifyUi();
                             }
 
                             @Override
@@ -1452,13 +2255,17 @@ public final class GatewayService extends Service {
 
                             @Override
                             public void onMuteChanged(boolean muted, String source) {
+                                desiredMuted = muted;
+                                config.setDesiredMuted(muted);
                                 syncHardwareAndMedia();
                                 notifyUi();
                             }
 
                             @Override
                             public void onPlayWav(String taskId, String channel, byte[] wavBytes) {
-                                assistantState = "speaking";
+                                if (!"media".equalsIgnoreCase(channel) && !"music".equalsIgnoreCase(channel)) {
+                                    assistantState = "speaking";
+                                }
                                 syncHardwareAndMedia();
                                 notifyUi();
                                 audioEngine.playWav(taskId, channel, wavBytes);
@@ -1466,12 +2273,12 @@ public final class GatewayService extends Service {
 
                             @Override
                             public void onPlayStreamBegin(String taskId, String channel, int sampleRate, int channels, String format) {
-                                audioEngine.beginStream(taskId, channel, sampleRate, channels);
                                 if (!"media".equalsIgnoreCase(channel) && !"music".equalsIgnoreCase(channel)) {
                                     assistantState = "speaking";
                                 }
                                 syncHardwareAndMedia();
                                 notifyUi();
+                                audioEngine.beginStream(taskId, channel, sampleRate, channels);
                             }
 
                             @Override
@@ -1498,29 +2305,51 @@ public final class GatewayService extends Service {
 
                             @Override
                             public void onKwsConfigUpdated(double threshold, double score, List<String> keywords) {
-                                config.saveAcoustics(
-                                        config.isUseVoiceCommAec(),
-                                        config.isSoftwareAecEnabled(),
-                                        config.getUplinkGain(),
-                                        (float) threshold,
-                                        (float) score);
+                                // P1-2: Mobile KWS sensitivity guard already executed inside NorthboundSession
+                                // BEFORE JNI reload, persistence, and receipt emission (single JNI reload).
+                                float nextThr = (float) threshold;
+                                float nextSc = (float) score;
+                                if (Math.abs(nextThr - config.getKwsThreshold()) > 0.005f
+                                        || Math.abs(nextSc - config.getKwsScore()) > 0.02f) {
+                                    config.saveAcoustics(
+                                            config.isUseVoiceCommAec(),
+                                            config.isSoftwareAecEnabled(),
+                                            config.getUplinkGain(),
+                                            nextThr,
+                                            nextSc);
+                                }
+                                NorthboundSession cur = activeSession;
+                                if (cur != null) {
+                                    config.setConfigV2StateJson(cur.exportPersistedConfigStateJson());
+                                }
                                 notifyUi();
                             }
 
                             @Override
                             public void onConfigBlockApplied(String block, Map<String, Object> values) {
-                                if ("kws".equals(block)) {
-                                    double thr = MiniJson.getDouble(values, "threshold", config.getKwsThreshold());
-                                    double sc = MiniJson.getDouble(values, "score", config.getKwsScore());
-                                    config.saveAcoustics(config.isUseVoiceCommAec(), config.isSoftwareAecEnabled(),
-                                            config.getUplinkGain(), (float) thr, (float) sc);
-                                    applyAcousticsOnly();
-                                } else if ("acoustics".equals(block)) {
-                                    double gain = MiniJson.getDouble(values, "uplink_gain", config.getUplinkGain());
-                                    config.saveAcoustics(config.isUseVoiceCommAec(), config.isSoftwareAecEnabled(),
-                                            (float) gain, config.getKwsThreshold(), config.getKwsScore());
-                                    applyAcousticsOnly();
+                                NorthboundSession cur = activeSession;
+                                if (cur != null) {
+                                    config.setConfigV2StateJson(cur.exportPersistedConfigStateJson());
                                 }
+                                if ("kws".equals(block)) {
+                                    // P1-2: Guarded effective threshold/score already applied to LocalKwsEngine,
+                                    // session state, configBlocks["kws"], and config_receipt by NorthboundSession.
+                                    float nextThr = (float) MiniJson.getDouble(values, "threshold", config.getKwsThreshold());
+                                    float nextSc = (float) MiniJson.getDouble(values, "score", config.getKwsScore());
+                                    if (Math.abs(nextThr - config.getKwsThreshold()) > 0.005f
+                                            || Math.abs(nextSc - config.getKwsScore()) > 0.02f) {
+                                        config.saveAcoustics(
+                                                config.isUseVoiceCommAec(),
+                                                config.isSoftwareAecEnabled(),
+                                                config.getUplinkGain(),
+                                                nextThr,
+                                                nextSc);
+                                    }
+                                    notifyUi();
+                                }
+                                // Note: "acoustics" (config_block_acoustics) is intentionally NOT advertised by
+                                // NorthboundSession — Android manages local AEC/uplink gain via GatewayConfig, while
+                                // hm-core owns per-unit volume_cap clamping and mic_gain_offset_db wake calibration.
                             }
 
                             @Override
@@ -1533,9 +2362,19 @@ public final class GatewayService extends Service {
                             }
                         });
 
-                session.setAecTailMs((audioEngine.isHardwareAecEnabled() || config.isSoftwareAecEnabled()) ? 160 : 0);
+                // Restore persisted config_apply_v2 state_revision, per-block block_generation,
+                // active_values, and duplex mode across reconnects BEFORE sending hello/config_state.
+                session.restorePersistedConfigStateJson(config.getConfigV2StateJson());
+                boolean aecOn = audioEngine.isHardwareAecEnabled() || config.isSoftwareAecEnabled();
+                session.setAecActive(aecOn);
+                session.setAecTailMs(aecOn ? 160 : 0);
+                session.setInitialMuted(desiredMuted);
                 session.setInitialVolumeLinear(audioEngine.getCurrentHardwareVolumeLinear());
-                session.setKwsSensitivity(config.getKwsThreshold(), config.getKwsScore());
+                if (session.getBlockGeneration("kws") == 0L
+                        || DeviceRoutingPolicy.isDot2DefaultKwsSensitivity(
+                                session.getKwsThreshold(), session.getKwsScore())) {
+                    session.setKwsSensitivity(config.getKwsThreshold(), config.getKwsScore());
+                }
                 session.setAuthToken(config.getBearerToken());
                 session.setLocalOfflineKwsReady(kwsEngine != null && kwsEngine.isProcessReady());
                 session.attachLocalKwsEngine(kwsEngine);
@@ -1554,9 +2393,19 @@ public final class GatewayService extends Service {
                             appendLog("WARN", "Ignored malformed frame: " + badJson.getMessage());
                         }
                     } catch (SocketTimeoutException idleTimeout) {
-                        // Send lightweight keepalive probe to verify half-open socket without dropping healthy links
+                        // Check half-open TX write stall even when mic capture is inactive
+                        TwoTierOutboundTransport tx = activeTxTransport;
+                        if (tx != null) {
+                            tx.checkWriteStall();
+                        }
+                        if (socket.isClosed()) {
+                            break;
+                        }
+                        // Send honest lightweight keepalive probe to verify half-open socket
                         try {
-                            session.sendEchoHealth("healthy", 0L);
+                            String kh = session.currentEchoHealth();
+                            String kr = "healthy".equals(kh) ? "keepalive_ok" : "aec_disabled";
+                            session.sendEchoHealth(kh, 0L, kr);
                         } catch (IOException probeErr) {
                             break;
                         }
@@ -1566,27 +2415,18 @@ public final class GatewayService extends Service {
                 boolean wasIntentional = intentionalReconnect.getAndSet(false);
                 connected = false;
                 if (!wasIntentional) {
-                    boolean httpReachable = isHttpManageOnline()
-                            || CoreApiClient.probeCoreHttp(host, config.getWebPort(), config.getBearerToken(), 650);
-                    if (httpReachable) {
-                        // Household speaker Core with HTTP :8930 open and :8932 loopback-only -> calm Manage-Only Mode!
-                        manageOnlyCore = true;
-                        consecutiveFailures = 0;
-                        connectionStatus = "Manage · " + host;
-                        updateNotification("Online (Manage) · " + host);
-                        syncHardwareAndMedia();
-                        notifyUi();
-                    } else {
-                        consecutiveFailures++;
-                        connectionStatus = "Offline (" + host + ")";
-                        appendLog("NET", "Disconnected [" + host + ":" + port + "]: " + e.getClass().getSimpleName());
-                        updateNotification("Reconnecting...");
-                        syncHardwareAndMedia();
-                        notifyUi();
+                    // MG-P0-01/02: A Voice Gateway profile (!config.isManageOnly()) MUST stay in
+                    // Voice Gateway reconnect mode on transient :8932 disconnect and NEVER silently
+                    // morph into Manage-Only mode or hijack a sibling speaker.
+                    consecutiveFailures++;
+                    connectionStatus = "Reconnecting (" + host + ")";
+                    appendLog("NET", "Disconnected [" + host + ":" + port + "]: " + e.getClass().getSimpleName());
+                    updateNotification("Reconnecting...");
+                    syncHardwareAndMedia();
+                    notifyUi();
 
-                        if (consecutiveFailures >= 1) {
-                            tryProfileFailover();
-                        }
+                    if (consecutiveFailures >= 1) {
+                        tryProfileFailover();
                     }
                 } else {
                     skipBackoff = true;
@@ -1607,9 +2447,7 @@ public final class GatewayService extends Service {
                 }
                 long backoffMs = rejectedUnauthorized[0]
                         ? 60_000L
-                        : (manageOnlyCore
-                        ? 30_000L
-                        : Math.min(8000L, 1500L + (long) consecutiveFailures * 1000L));
+                        : Math.min(8000L, 1500L + (long) consecutiveFailures * 1000L);
                 try {
                     Thread.sleep(backoffMs);
                 } catch (InterruptedException ignored) {
@@ -1657,18 +2495,23 @@ public final class GatewayService extends Service {
                 connected ? ("Online · " + config.getCoreHost()) : "Connecting to Home Mate Core...");
         try {
             if (Build.VERSION.SDK_INT >= 30) {
+                boolean wantsMicFgs = hasRecordAudioPermission() && !fromBootRestricted;
                 int fgsType = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
-                if (hasRecordAudioPermission() && !fromBootRestricted) {
+                if (wantsMicFgs) {
                     fgsType |= android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
                 }
                 startForeground(NOTIFICATION_ID, notification, fgsType);
+                micFgsGranted = wantsMicFgs;
             } else if (Build.VERSION.SDK_INT >= 29) {
                 startForeground(NOTIFICATION_ID, notification,
                         android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                micFgsGranted = hasRecordAudioPermission();
             } else {
                 startForeground(NOTIFICATION_ID, notification);
+                micFgsGranted = hasRecordAudioPermission();
             }
         } catch (SecurityException se) {
+            micFgsGranted = false;
             appendLog("FGS", "Microphone FGS restricted (" + se.getMessage() + "), falling back to mediaPlayback");
             try {
                 if (Build.VERSION.SDK_INT >= 29) {
@@ -1682,6 +2525,7 @@ public final class GatewayService extends Service {
                 stopSelf();
             }
         } catch (Throwable t) {
+            micFgsGranted = false;
             appendLog("FGS", "startForeground failed: " + t.getMessage());
             stopSelf();
         }

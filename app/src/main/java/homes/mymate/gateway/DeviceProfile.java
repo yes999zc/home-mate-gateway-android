@@ -115,13 +115,13 @@ public final class DeviceProfile {
         boolean headless = (effective == FormFactor.HEADLESS_SPEAKER);
 
         float gain = 1.0f;
-        float kwsThr = 0.28f;
+        float kwsThr = 0.22f;
         if (effective == FormFactor.HEADLESS_SPEAKER || effective == FormFactor.SMART_DISPLAY) {
             gain = 1.0f;
-            kwsThr = 0.26f;
+            kwsThr = 0.22f;
         } else if (effective == FormFactor.WALL_PANEL_86) {
             gain = 1.2f;
-            kwsThr = 0.28f;
+            kwsThr = 0.24f;
         }
 
         return new DeviceProfile(effective, dualPane, compactSquare, headless, wDp, hDp, gain, kwsThr);

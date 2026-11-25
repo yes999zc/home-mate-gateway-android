@@ -18,7 +18,7 @@ public final class Icons {
     public enum Name {
         MIC, MIC_OFF, STOP, MUSIC, PLAY, PAUSE, SKIP_NEXT, SKIP_PREV,
         ROOMS, CONSOLE, SETTINGS, CLOCK, SEND, VOLUME, REFRESH, WIFI, CHECK, EXTERNAL, TRASH, HISTORY,
-        CHEVRON_DOWN, CHEVRON_RIGHT, KEY
+        CHEVRON_DOWN, CHEVRON_UP, CHEVRON_RIGHT, KEY, CLOSE
     }
 
     private Icons() {
@@ -166,6 +166,13 @@ public final class Icons {
                     tmpPath.lineTo(s * 0.76f, s * 0.38f);
                     c.drawPath(tmpPath, stroke);
                     break;
+                case CHEVRON_UP:
+                    tmpPath.reset();
+                    tmpPath.moveTo(s * 0.24f, s * 0.62f);
+                    tmpPath.lineTo(s * 0.50f, s * 0.36f);
+                    tmpPath.lineTo(s * 0.76f, s * 0.62f);
+                    c.drawPath(tmpPath, stroke);
+                    break;
                 case CHEVRON_RIGHT:
                     tmpPath.reset();
                     tmpPath.moveTo(s * 0.38f, s * 0.24f);
@@ -178,6 +185,10 @@ public final class Icons {
                     c.drawLine(s * 0.52f, s * 0.50f, s * 0.84f, s * 0.50f, stroke);
                     c.drawLine(s * 0.72f, s * 0.50f, s * 0.72f, s * 0.64f, stroke);
                     c.drawLine(s * 0.82f, s * 0.50f, s * 0.82f, s * 0.62f, stroke);
+                    break;
+                case CLOSE:
+                    c.drawLine(s * 0.26f, s * 0.26f, s * 0.74f, s * 0.74f, stroke);
+                    c.drawLine(s * 0.74f, s * 0.26f, s * 0.26f, s * 0.74f, stroke);
                     break;
             }
             c.restore();

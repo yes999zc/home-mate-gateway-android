@@ -88,7 +88,9 @@ public final class ParticleOrbView extends View {
     private float slowEnergy = 0f;
     private float fastBass = 0f;
     private float slowBass = 0f;
+    private float musicDynamics = 0f;
     private float beatImpulse = 0f;
+    private float musicRippleProgress = 1.0f;
 
     // Smoothed RGB channels (start in Alabaster Pearl / Silver Mist idle)
     private float curR1 = 228f, curG1 = 228f, curB1 = 232f;
@@ -289,14 +291,11 @@ public final class ParticleOrbView extends View {
 
     /** Thread-safe 25Hz mic / 33Hz TTS / 35Hz music-beat live energy hook (zero allocations). */
     public void setLiveAudioEnergy(double rmsDbfs, double bassDbfs, boolean isMusic) {
-        float normFull = (float) Math.max(0.0, Math.min(1.0, (rmsDbfs + (isMusic ? 46.0 : 58.0)) / (isMusic ? 32.0 : 36.0)));
-        float normBass = (float) Math.max(0.0, Math.min(1.0, (bassDbfs + 44.0) / 30.0));
+        // Mastered music averages -14..-10 dBFS; keep wide headroom (-40..-4 dBFS) so it never pegs at 1.0
+        float normFull = (float) Math.max(0.0, Math.min(1.0, (rmsDbfs + (isMusic ? 40.0 : 58.0)) / (isMusic ? 36.0 : 36.0)));
+        float normBass = (float) Math.max(0.0, Math.min(1.0, (bassDbfs + 38.0) / 34.0));
         this.targetAudioLevel = normFull;
         this.targetBassLevel = isMusic ? normBass : normFull * 0.5f;
-    }
-
-    public void setLiveRmsDbfs(double rmsDbfs) {
-        setLiveAudioEnergy(rmsDbfs, rmsDbfs, false);
     }
 
     public void updateState(boolean connected, boolean muted, String assistantState, boolean musicActive, double rmsDbfs) {
@@ -392,22 +391,33 @@ public final class ParticleOrbView extends View {
     private void stepSimulation(float dt) {
         simTime += dt;
 
-        // Dual-envelope audio tracking + bass beat transient detector
+        // Dual-envelope audio tracking + relative music dynamics & silky bass kick detector
         float targetE = targetAudioLevel;
-        float fastAlpha = targetE > fastEnergy ? Math.min(1f, dt * 18f) : Math.min(1f, dt * 6.5f);
+        float fastAlpha = targetE > fastEnergy ? Math.min(1f, dt * 12f) : Math.min(1f, dt * 5.0f);
         fastEnergy += (targetE - fastEnergy) * fastAlpha;
-        slowEnergy += (targetE - slowEnergy) * Math.min(1f, dt * 2.8f);
+        slowEnergy += (targetE - slowEnergy) * Math.min(1f, dt * 2.2f);
+
+        float relDyn = Math.max(0f, Math.min(1.0f, (fastEnergy - slowEnergy * 0.90f) * 2.8f));
+        float dynAlpha = relDyn > musicDynamics ? Math.min(1f, dt * 10f) : Math.min(1f, dt * 3.5f);
+        musicDynamics += (relDyn - musicDynamics) * dynAlpha;
 
         float targetB = targetBassLevel;
-        float bassFastAlpha = targetB > fastBass ? Math.min(1f, dt * 24f) : Math.min(1f, dt * 8.0f);
+        float bassFastAlpha = targetB > fastBass ? Math.min(1f, dt * 16f) : Math.min(1f, dt * 6.0f);
         fastBass += (targetB - fastBass) * bassFastAlpha;
-        slowBass += (targetB - slowBass) * Math.min(1f, dt * 2.5f);
+        slowBass += (targetB - slowBass) * Math.min(1f, dt * 2.0f);
 
-        float transientKick = Math.max(0f, fastBass - slowBass * 1.05f);
+        float transientKick = Math.max(0f, Math.min(1.0f, (fastBass - slowBass * 1.06f) * 2.2f));
         if (transientKick > beatImpulse) {
-            beatImpulse = Math.min(1.0f, transientKick * 2.6f);
+            beatImpulse += (transientKick - beatImpulse) * Math.min(1f, dt * 18f);
         } else {
-            beatImpulse = Math.max(0f, beatImpulse - dt * 3.8f);
+            beatImpulse = Math.max(0f, beatImpulse - dt * 2.6f);
+        }
+
+        if (targetState == STATE_MUSIC && beatImpulse > 0.30f && musicRippleProgress >= 0.88f) {
+            musicRippleProgress = 0.0f;
+        }
+        if (musicRippleProgress < 1.0f) {
+            musicRippleProgress = Math.min(1.0f, musicRippleProgress + dt / 0.85f);
         }
 
         if (shockwaveProgress < 1.0f) {
@@ -444,13 +454,13 @@ public final class ParticleOrbView extends View {
                 tr1 = 250f; tg1 = 68f; tb1 = 92f;    // Apple Music Rose Coral
                 tr2 = 255f; tg2 = 149f; tb2 = 0f;    // Apple Warm Amber
                 trc = 94f; tgc = 92f; tbc = 230f;    // Deep Harmonic Indigo Core
-                tSpin = 0.42f + fastBass * 0.55f;
-                tTurb = 0.14f + fastEnergy * 0.18f;
-                tExp = 1.06f;
+                tSpin = 0.32f + beatImpulse * 0.12f;
+                tTurb = 0.04f;
+                tExp = 1.02f;
                 tVortex = 0.0f;
-                tWave = 0.24f;
+                tWave = 0.07f;
                 tMusicRing = 1.0f;
-                tFil = 0.32f;
+                tFil = 0.24f;
             } else if (st == STATE_MUTED) {
                 tr1 = 224f; tg1 = 49f; tb1 = 49f;    // Apple Red
                 tr2 = 142f; tg2 = 142f; tb2 = 147f;  // System Gray
@@ -488,13 +498,13 @@ public final class ParticleOrbView extends View {
                 tr1 = 255f; tg1 = 159f; tb1 = 10f;   // Apple Dark Amber #FF9F0A
                 tr2 = 255f; tg2 = 96f; tb2 = 120f;   // Apple Music Rose Glow
                 trc = 255f; tgc = 244f; tbc = 224f;  // Warm Pearl Core
-                tSpin = 0.42f + fastBass * 0.55f;
-                tTurb = 0.14f + fastEnergy * 0.18f;
-                tExp = 1.06f;
+                tSpin = 0.32f + beatImpulse * 0.12f;
+                tTurb = 0.04f;
+                tExp = 1.02f;
                 tVortex = 0.0f;
-                tWave = 0.24f;
+                tWave = 0.07f;
                 tMusicRing = 1.0f;
-                tFil = 0.40f;
+                tFil = 0.28f;
             } else if (st == STATE_MUTED) {
                 tr1 = 255f; tg1 = 69f; tb1 = 58f;    // Apple Dark Red
                 tr2 = 99f; tg2 = 99f; tb2 = 102f;
@@ -555,26 +565,29 @@ public final class ParticleOrbView extends View {
         }
 
         float baseRadius = Math.min(w, h) * 0.305f;
-        float breath = (float) Math.sin(simTime * 1.65f) * 0.032f;
-        float audioBoost = fastEnergy * 0.22f + slowEnergy * 0.07f + beatImpulse * 0.16f;
+        float breath = (float) Math.sin(simTime * 1.65f) * 0.028f;
+        float voiceBoost = fastEnergy * 0.20f + slowEnergy * 0.06f + beatImpulse * 0.10f;
+        float musicBoost = slowEnergy * 0.025f + musicDynamics * 0.045f + beatImpulse * 0.085f;
+        float audioBoost = voiceBoost * (1.0f - curMusicRingAmp) + musicBoost * curMusicRingAmp;
+        float visualEnergy = fastEnergy * (1.0f - curMusicRingAmp) + musicDynamics * curMusicRingAmp;
         float shockKick = (shockwaveProgress < 1.0f)
                 ? (float) Math.sin(shockwaveProgress * Math.PI) * 0.15f
                 : 0f;
         float globeRadius = baseRadius * (curExpand + breath + audioBoost + shockKick);
 
         // Layer 1: Subtle ambient halo (delicate tinted cushion on Light Mode, luminous aura on Dark Mode)
-        float haloR = globeRadius * (1.68f + slowEnergy * 0.24f + beatImpulse * 0.20f);
+        float haloR = globeRadius * (1.64f + slowEnergy * 0.12f + beatImpulse * 0.12f);
         int haloAlpha = lightTheme
-                ? Math.max(12, Math.min(48, Math.round((0.10f + fastEnergy * 0.10f + beatImpulse * 0.08f) * 255f)))
-                : Math.max(18, Math.min(82, Math.round((0.18f + fastEnergy * 0.18f + beatImpulse * 0.12f) * 255f)));
+                ? Math.max(12, Math.min(46, Math.round((0.10f + visualEnergy * 0.08f + beatImpulse * 0.06f) * 255f)))
+                : Math.max(18, Math.min(78, Math.round((0.18f + visualEnergy * 0.12f + beatImpulse * 0.09f) * 255f)));
         spritePaint.setColor(Color.argb(haloAlpha, (int) curR2, (int) curG2, (int) curB2));
         dstRect.set(cx - haloR, cy - haloR, cx + haloR, cy + haloR);
         canvas.drawBitmap(haloSprite, null, dstRect, spritePaint);
 
-        float coreR = globeRadius * (0.72f + fastEnergy * 0.18f + beatImpulse * 0.14f);
+        float coreR = globeRadius * (0.72f + visualEnergy * 0.10f + beatImpulse * 0.09f);
         int coreAlpha = lightTheme
-                ? Math.max(16, Math.min(68, Math.round((0.14f + fastEnergy * 0.12f + beatImpulse * 0.10f) * 255f)))
-                : Math.max(28, Math.min(138, Math.round((0.28f + fastEnergy * 0.24f + beatImpulse * 0.18f) * 255f)));
+                ? Math.max(16, Math.min(64, Math.round((0.14f + visualEnergy * 0.09f + beatImpulse * 0.07f) * 255f)))
+                : Math.max(28, Math.min(126, Math.round((0.28f + visualEnergy * 0.16f + beatImpulse * 0.12f) * 255f)));
         addSpritePaint.setColor(Color.argb(coreAlpha, (int) curR1, (int) curG1, (int) curB1));
         dstRect.set(cx - coreR, cy - coreR, cx + coreR, cy + coreR);
         canvas.drawBitmap(haloSprite, null, dstRect, addSpritePaint);
@@ -603,24 +616,29 @@ public final class ParticleOrbView extends View {
             float rMul = baseR[i];
             float ph = phase[i];
 
-            float curl = curTurbulence * (1.0f + fastEnergy * 1.6f);
-            float w1 = (float) Math.sin(simTime * 2.0f + ph + py * 3.1f);
-            float w2 = (float) Math.cos(simTime * 1.6f + ph * 1.3f + px * 2.7f);
+            // Keep main 3D sphere cohesive during music (no chaotic random particle scatter)
+            float curl = curTurbulence * (1.0f + visualEnergy * 1.4f * (1.0f - curMusicRingAmp * 0.80f));
+            float w1 = (float) Math.sin(simTime * 1.8f + ph + py * 3.1f);
+            float w2 = (float) Math.cos(simTime * 1.4f + ph * 1.3f + px * 2.7f);
             rMul += (w1 * 0.55f + w2 * 0.45f) * curl;
 
-            // Voice / music harmonic latitude standing waves
+            // Voice / music harmonic latitude standing waves (slow silky surface ripple during music)
             if (curWaveAmp > 0.005f) {
-                float freq = (sh == 2) ? 7.0f : 5.0f;
-                float latWave = (float) Math.sin(phi0[i] * freq - simTime * 6.0f + theta0[i] * 2.0f * curMusicRingAmp)
-                        * curWaveAmp * (0.28f + fastEnergy * 1.15f + beatImpulse * 0.85f);
+                float freq = (sh == 2) ? 4.0f : (curMusicRingAmp > 0.5f ? 3.0f : 5.0f);
+                float waveSpeed = 6.0f * (1.0f - curMusicRingAmp * 0.60f);
+                float waveGain = (curMusicRingAmp > 0.5f)
+                        ? (0.22f + musicDynamics * 0.55f + beatImpulse * 0.50f)
+                        : (0.28f + fastEnergy * 1.05f + beatImpulse * 0.55f);
+                float latWave = (float) Math.sin(phi0[i] * freq - simTime * waveSpeed + theta0[i] * 2.0f * curMusicRingAmp)
+                        * curWaveAmp * waveGain;
                 rMul += latWave;
             }
 
-            // Music rhythm: equatorial dust ring undulates vertically & radially with bass beats!
+            // Music rhythm: smooth, coherent 3-lobe equatorial orbital soundwave ring
             if (curMusicRingAmp > 0.01f && sh == 2) {
-                float eqWave = (float) Math.sin(theta0[i] * 4.0f + simTime * 4.8f);
-                py += eqWave * 0.18f * curMusicRingAmp * (0.25f + fastEnergy * 0.9f + beatImpulse * 0.8f);
-                rMul += (0.08f + beatImpulse * 0.24f) * curMusicRingAmp;
+                float eqWave = (float) Math.sin(theta0[i] * 3.0f - simTime * 2.4f);
+                py += eqWave * 0.085f * curMusicRingAmp * (0.30f + musicDynamics * 0.55f + beatImpulse * 0.55f);
+                rMul += (0.04f + beatImpulse * 0.10f) * curMusicRingAmp;
             }
 
             // Thinking twin-helix vortex morph
@@ -660,7 +678,8 @@ public final class ParticleOrbView extends View {
 
             float depthNorm = Math.max(0.0f, Math.min(1.0f, (fz + 1.35f) / 2.7f));
             float basePt = (sh == 0 ? 4.4f : (sh == 1 ? 3.9f : 2.8f)) * density;
-            projSize[i] = basePt * sizeMul[i] * persp * (0.65f + 0.55f * depthNorm) * (1.0f + fastEnergy * 0.30f + beatImpulse * 0.25f);
+            float sizeBoost = 1.0f + visualEnergy * (0.24f - curMusicRingAmp * 0.14f) + beatImpulse * (0.18f - curMusicRingAmp * 0.06f);
+            projSize[i] = basePt * sizeMul[i] * persp * (0.65f + 0.55f * depthNorm) * sizeBoost;
             projAlpha[i] = (0.16f + 0.84f * depthNorm) * (sh == 2 ? 0.75f : 1.0f);
             sortOrder[slot] = i;
         }
@@ -699,7 +718,7 @@ public final class ParticleOrbView extends View {
                     float dy = ay - projY[ib];
                     float dSq = dx * dx + dy * dy;
                     if (dSq < maxDistSq) {
-                        float strength = (1.0f - (float) Math.sqrt(dSq) / maxDist) * curFilamentAlpha * (0.65f + fastEnergy * 0.55f + beatImpulse * 0.4f);
+                        float strength = (1.0f - (float) Math.sqrt(dSq) / maxDist) * curFilamentAlpha * (0.65f + visualEnergy * 0.35f + beatImpulse * 0.25f);
                         int alpha = Math.max(6, Math.min(96, Math.round(strength * 255f)));
                         filamentPaint.setColor(Color.argb(alpha, (int) curR1, (int) curG1, (int) curB1));
                         canvas.drawLine(ax, ay, projX[ib], projY[ib], filamentPaint);
@@ -742,7 +761,16 @@ public final class ParticleOrbView extends View {
             canvas.drawBitmap(glowSprite, null, dstRect, addSpritePaint);
         }
 
-        // Layer 5: 3D Spherical Touch Shockwave Ripple (or subtle music beat pulse ring)
+        // Layer 5: Subtle concentric music bass-kick pulse halo + Touch Shockwave Ripple
+        if (curMusicRingAmp > 0.10f && musicRippleProgress < 1.0f) {
+            float easeOut = 1.0f - (1.0f - musicRippleProgress) * (1.0f - musicRippleProgress);
+            float pulseR = globeRadius * (0.98f + easeOut * 0.58f);
+            float maxAlpha = lightTheme ? 44f : 68f;
+            int pulseAlpha = Math.max(0, Math.min(90, Math.round((1.0f - musicRippleProgress) * maxAlpha * curMusicRingAmp)));
+            shockwavePaint.setStrokeWidth((1.6f - musicRippleProgress * 0.8f) * density);
+            shockwavePaint.setColor(Color.argb(pulseAlpha, (int) curR1, (int) curG1, (int) curB1));
+            canvas.drawCircle(cx, cy, pulseR, shockwavePaint);
+        }
         if (shockwaveProgress < 1.0f) {
             float easeOut = 1.0f - (1.0f - shockwaveProgress) * (1.0f - shockwaveProgress);
             float waveR = globeRadius * (0.48f + easeOut * 1.12f);

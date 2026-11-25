@@ -24,6 +24,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -35,7 +36,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * - Tagged PcmBlock(pcm, capturedWallMs, rmsDbfs) computes real queue+decode lagMs and stamps
  *   detection timestamps immediately at spotter match time.
  * - Runs getResult() + reset() INSIDE while(spotter.isReady(stream)) matching reference hm-kws driver.c.
- * - Enforces min_wake_ms >= 400ms and +80ms frame length in L2 acoustic verification.
+ * - Enforces min_wake_ms >= 280ms and +80ms frame length in L2 acoustic verification.
  * - Periodically resets OnlineStream every 6 minutes during confirmed silence to prevent 24/7 native RSS drift.
  * - Atomic kw.txt write (kw.txt.tmp -> renameTo) + .bak rollback & backoff retry (never kills supervisor permanently).
  * - Always hashes actual on-disk kw.txt bytes for truthful loaded_hash telemetry.
@@ -47,17 +48,24 @@ public final class LocalKwsEngine {
     public static final String MODE_ASR_HYBRID = "ASR_HYBRID";
 
     public static final List<String> DEFAULT_RETREAT_WORDS = Arrays.asList(
-            "退下", "退下吧", "停止播放", "别说了", "闭嘴");
+            "退下", "退下吧", "退一下吧", "停止播放", "滚一边儿去");
 
     public static final String DEFAULT_KEYWORDS_TXT =
             "n ǐ h ǎo x iǎo zh ì @你好小智\n"
-            + "x iǎo ài t óng x ué @小爱同学\n"
-            + "n ǐ h ǎo g āo d á @你好高达\n"
+            + "z àn t íng b ō f àng @暂停播放\n"
+            + "j ì x ù b ō f àng @继续播放\n"
+            + "x ià y ì sh ǒu @下一首\n"
+            + "t íng zh ǐ b ō f àng @停止播放\n"
+            + "g ǔn y ì b iān ér q ù @滚一边儿去\n"
             + "t uì x ià @退下\n"
             + "t uì x ià b a @退下吧\n"
-            + "t íng zh ǐ b ō f àng @停止播放\n"
-            + "b ié sh uō l e @别说了\n"
-            + "b ì z uǐ @闭嘴\n";
+            + "t uì y í x ià b a @退一下吧\n";
+
+    private static final float KWS_AGC_TARGET_RMS = 0.10f; // ~ -20 dBFS optimal for Zipformer KWS
+    private static final float KWS_AGC_MIN_SPEECH_RMS = 0.002f; // ~ -54 dBFS
+    private static final float KWS_AGC_IDLE_FLOOR_GAIN = 1.5f;
+    private static final float KWS_AGC_MAX_GAIN = 3.5f;
+    private static final long MIN_WAKE_DURATION_MS = 280L;
 
     private static final long IDLE_STREAM_RESET_INTERVAL_MS = 6L * 60L * 1000L; // 6 minutes
     private static final int SILENCE_BLOCKS_FOR_RESET = 25; // 2.0s of quiet @ 80ms/block
@@ -175,11 +183,22 @@ public final class LocalKwsEngine {
     private volatile boolean running = false;
     private volatile boolean processReady = false;
     private volatile String activeEngineMode = MODE_ASR_HYBRID;
-    private double threshold = 0.28;
-    private double score = 2.60;
+    private double threshold = 0.22;
+    private double score = 3.00;
     private String currentKeywordsHash = "";
     private volatile Process activeProcess;
     private final AtomicBoolean reloadRequested = new AtomicBoolean(false);
+    private final Object deployLock = new Object();
+    private final Object reloadBarrierLock = new Object();
+    private volatile CountDownLatch workspaceReadyLatch = null;
+    private volatile long workspaceWaitTimeoutMs = 15_000L;
+    private volatile boolean customKeywordsDeployed = false;
+    private long requestedReloadSeq = 0L;
+    private long completedReloadSeq = 0L;
+    private boolean lastReloadSucceeded = true;
+    private String lastReloadDetail = "applied";
+    private volatile boolean forceAwaitReloadForTest = false;
+    private volatile long reloadWaitTimeoutMs = 3500L;
     private final AtomicLong detectionCount = new AtomicLong(0);
     private final AtomicLong restartCount = new AtomicLong(0);
     private Thread supervisorThread;
@@ -197,6 +216,73 @@ public final class LocalKwsEngine {
 
     public void setAssetPreparer(AssetPreparer preparer) {
         this.assetPreparer = preparer;
+        this.workspaceReadyLatch = (preparer != null) ? new CountDownLatch(1) : null;
+    }
+
+    public void setWorkspaceWaitTimeoutForTest(long timeoutMs) {
+        this.workspaceWaitTimeoutMs = Math.max(50L, timeoutMs);
+    }
+
+    private void awaitWorkspacePreparedBounded() {
+        CountDownLatch latch = this.workspaceReadyLatch;
+        if (latch == null || !running) {
+            return;
+        }
+        try {
+            latch.await(workspaceWaitTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Installs or upgrades bundled default {@code kw.txt} under {@code deployLock} using an
+     * isolated temp file ({@code kw.default.tmp}), guaranteeing cold-boot asset preparation NEVER
+     * overwrites or races custom keywords already deployed by Core.
+     *
+     * @param prevDefaultHash previously recorded bundled-default FNV hash (empty on fresh install)
+     * @return the newly installed bundled-default hash if written, or {@code null} if skipped
+     */
+    public String syncDefaultKeywordsIfNotCustom(String prevDefaultHash) {
+        if (workDir == null) {
+            return null;
+        }
+        synchronized (deployLock) {
+            File kwFile = new File(workDir, "kw.txt");
+            File customMarker = new File(workDir, ".kw.custom");
+            String newDefaultHash = NorthboundSession.fnv1a64Hex(DEFAULT_KEYWORDS_TXT);
+
+            if (customKeywordsDeployed || customMarker.exists()) {
+                return null;
+            }
+
+            boolean shouldWrite = false;
+            if (!kwFile.exists() || kwFile.length() == 0) {
+                shouldWrite = true;
+            } else if (prevDefaultHash != null && !prevDefaultHash.isEmpty()
+                    && !newDefaultHash.equals(prevDefaultHash)) {
+                String currentDiskHash = readAndHashKeywordsFile(kwFile);
+                if (prevDefaultHash.equals(currentDiskHash)) {
+                    shouldWrite = true;
+                }
+            }
+
+            if (!shouldWrite) {
+                return null;
+            }
+
+            File tmpFile = new File(workDir, "kw.default.tmp");
+            try {
+                writeUtf8Atomically(tmpFile, kwFile, DEFAULT_KEYWORDS_TXT);
+                synchronized (this) {
+                    this.currentKeywordsHash = newDefaultHash;
+                }
+                return newDefaultHash;
+            } catch (IOException e) {
+                tmpFile.delete();
+                return null;
+            }
+        }
     }
 
     public boolean isProcessReady() {
@@ -276,8 +362,8 @@ public final class LocalKwsEngine {
                 ? Boolean.valueOf(MiniJson.getBoolean(obj, "l2_passed", false))
                 : null;
         boolean vadSpeech = MiniJson.getBoolean(obj, "speech", false);
-        double thr = MiniJson.getDouble(obj, "threshold", 0.28);
-        double sc = MiniJson.getDouble(obj, "score", 2.60);
+        double thr = MiniJson.getDouble(obj, "threshold", 0.22);
+        double sc = MiniJson.getDouble(obj, "score", 3.00);
         String errorStage = MiniJson.getString(obj, "stage", null);
 
         return new KwsEvent(
@@ -358,36 +444,166 @@ public final class LocalKwsEngine {
         }
     }
 
-    public synchronized ValidationResult deployKeywords(
+    /**
+     * Validates, atomically writes {@code kw.txt} (backing up {@code kw.txt.bak}), and waits for
+     * the JNI worker thread to finish reloading before returning.
+     *
+     * <p>Lock discipline: {@code deployLock} serializes concurrent deployments, while {@code this}
+     * is held ONLY for quick in-memory/file state transitions and released BEFORE waiting on
+     * {@code reloadBarrierLock} so {@code hm-kws-engine} can safely acquire {@code synchronized (this)}
+     * without deadlocking.
+     */
+    public ValidationResult deployKeywords(
             String keywordsTxt,
             List<String> retreatWords,
             double nextThreshold,
             double nextScore) {
-        reloadTokensSetIfPresent();
-        ValidationResult vr = validateKeywordsTable(keywordsTxt, validTokenSet);
-        if (!vr.valid) {
+        // Wait for cold-boot workspace asset prep BEFORE taking deployLock so KwsAssetInstaller
+        // finishes unpacking tokens.txt and syncing defaults without deadlocking or racing kw.txt.
+        awaitWorkspacePreparedBounded();
+        synchronized (deployLock) {
+            ValidationResult vr;
+            double prevThreshold;
+            double prevScore;
+            List<String> prevRetreats;
+            File kwFile = workDir != null ? new File(workDir, "kw.txt") : null;
+            File bakFile = workDir != null ? new File(workDir, "kw.txt.bak") : null;
+            boolean activeNativeRuntime;
+
+            synchronized (this) {
+                reloadTokensSetIfPresent();
+                vr = validateKeywordsTable(keywordsTxt, validTokenSet);
+                if (!vr.valid) {
+                    return vr;
+                }
+                prevThreshold = this.threshold;
+                prevScore = this.score;
+                prevRetreats = new ArrayList<String>(this.retreatWordSet);
+
+                this.threshold = Math.max(0.10, Math.min(0.80, nextThreshold));
+                this.score = Math.max(0.50, Math.min(5.00, nextScore));
+                setRetreatWords(retreatWords);
+
+                if (workDir != null && kwFile != null && bakFile != null) {
+                    File tmpFile = new File(workDir, "kw.deploy.tmp");
+                    try {
+                        if (kwFile.exists() && kwFile.length() > 0) {
+                            copyFile(kwFile, bakFile);
+                        }
+                        writeUtf8Atomically(tmpFile, kwFile, keywordsTxt);
+                        this.customKeywordsDeployed = true;
+                        File marker = new File(workDir, ".kw.custom");
+                        if (!marker.exists()) {
+                            try {
+                                marker.createNewFile();
+                            } catch (IOException ignored) {
+                            }
+                        }
+                    } catch (IOException e) {
+                        this.threshold = prevThreshold;
+                        this.score = prevScore;
+                        setRetreatWords(prevRetreats);
+                        return new ValidationResult(false, vr.keywordCount, "write_failed:" + e.getMessage(), vr.invalidTokens);
+                    }
+                } else {
+                    this.customKeywordsDeployed = true;
+                }
+                this.currentKeywordsHash = NorthboundSession.fnv1a64Hex(keywordsTxt);
+                activeNativeRuntime = forceAwaitReloadForTest
+                        || (running && MODE_JNI_OFFLINE.equals(activeEngineMode));
+            }
+
+            long targetSeq;
+            synchronized (reloadBarrierLock) {
+                requestedReloadSeq++;
+                targetSeq = requestedReloadSeq;
+            }
+            requestHotReload();
+            if (!activeNativeRuntime) {
+                return vr;
+            }
+
+            // Wait OUTSIDE `synchronized (this)` so the JNI thread can acquire `synchronized (this)`
+            // to read the new thresholds/keywords and signal completion without deadlocking.
+            long deadline = System.currentTimeMillis() + reloadWaitTimeoutMs;
+            boolean completed = false;
+            boolean ok = false;
+            String detail = "reload_timeout";
+            synchronized (reloadBarrierLock) {
+                while (completedReloadSeq < targetSeq) {
+                    long rem = deadline - System.currentTimeMillis();
+                    if (rem <= 0L) {
+                        break;
+                    }
+                    try {
+                        reloadBarrierLock.wait(rem);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                if (completedReloadSeq >= targetSeq) {
+                    completed = true;
+                    ok = lastReloadSucceeded;
+                    detail = lastReloadDetail;
+                }
+            }
+            if (!completed || !ok) {
+                synchronized (this) {
+                    this.threshold = prevThreshold;
+                    this.score = prevScore;
+                    setRetreatWords(prevRetreats);
+                    if (kwFile != null && bakFile != null && bakFile.exists() && bakFile.length() > 0) {
+                        try {
+                            copyFile(bakFile, kwFile);
+                        } catch (IOException ignored) {
+                        }
+                    }
+                    if (kwFile != null) {
+                        this.currentKeywordsHash = readAndHashKeywordsFile(kwFile);
+                    }
+                }
+                if (!completed) {
+                    requestHotReload();
+                }
+                return new ValidationResult(false, vr.keywordCount, completed ? detail : "reload_timeout", vr.invalidTokens);
+            }
             return vr;
         }
-        this.threshold = Math.max(0.10, Math.min(0.80, nextThreshold));
-        this.score = Math.max(0.50, Math.min(5.00, nextScore));
-        setRetreatWords(retreatWords);
+    }
 
-        if (workDir != null) {
-            File kwFile = new File(workDir, "kw.txt");
-            File bakFile = new File(workDir, "kw.txt.bak");
-            File tmpFile = new File(workDir, "kw.txt.tmp");
-            try {
-                if (kwFile.exists() && kwFile.length() > 0) {
-                    copyFile(kwFile, bakFile);
-                }
-                writeUtf8Atomically(tmpFile, kwFile, keywordsTxt);
-            } catch (IOException e) {
-                return new ValidationResult(false, vr.keywordCount, "write_failed:" + e.getMessage(), vr.invalidTokens);
+    public synchronized double getThresholdForTest() {
+        return threshold;
+    }
+
+    public synchronized double getScoreForTest() {
+        return score;
+    }
+
+    public void configureReloadBarrierForTest(boolean forceAwait, long timeoutMs) {
+        this.forceAwaitReloadForTest = forceAwait;
+        this.reloadWaitTimeoutMs = Math.max(50L, timeoutMs);
+    }
+
+    public long getRequestedReloadSeqForTest() {
+        synchronized (reloadBarrierLock) {
+            return requestedReloadSeq;
+        }
+    }
+
+    public void notifyReloadOutcomeForTest(long seq, boolean succeeded, String detail) {
+        notifyReloadOutcome(seq, succeeded, detail);
+    }
+
+    private void notifyReloadOutcome(long seq, boolean succeeded, String detail) {
+        synchronized (reloadBarrierLock) {
+            if (seq > completedReloadSeq) {
+                completedReloadSeq = seq;
+                lastReloadSucceeded = succeeded;
+                lastReloadDetail = detail != null ? detail : (succeeded ? "applied" : "reload_failed");
+                reloadBarrierLock.notifyAll();
             }
         }
-        this.currentKeywordsHash = NorthboundSession.fnv1a64Hex(keywordsTxt);
-        requestHotReload();
-        return vr;
     }
 
     private void requestHotReload() {
@@ -432,6 +648,10 @@ public final class LocalKwsEngine {
     public synchronized void stop() {
         running = false;
         processReady = false;
+        CountDownLatch latch = this.workspaceReadyLatch;
+        if (latch != null) {
+            latch.countDown();
+        }
         Process proc = activeProcess;
         if (proc != null) {
             proc.destroy();
@@ -444,11 +664,19 @@ public final class LocalKwsEngine {
     }
 
     private void runSupervisorLoop() {
-        if (assetPreparer != null) {
+        AssetPreparer preparer = this.assetPreparer;
+        CountDownLatch latch = this.workspaceReadyLatch;
+        if (preparer != null) {
             try {
-                assetPreparer.prepareWorkspace();
+                preparer.prepareWorkspace();
             } catch (Throwable ignored) {
+            } finally {
+                if (latch != null) {
+                    latch.countDown();
+                }
             }
+        } else if (latch != null) {
+            latch.countDown();
         }
         reloadTokensSetIfPresent();
 
@@ -485,6 +713,10 @@ public final class LocalKwsEngine {
 
         while (running && !Thread.currentThread().isInterrupted()) {
             reloadRequested.set(false);
+            long loadingReloadSeq;
+            synchronized (reloadBarrierLock) {
+                loadingReloadSeq = requestedReloadSeq;
+            }
             double snapThr;
             double snapScore;
             String snapHash;
@@ -524,6 +756,7 @@ public final class LocalKwsEngine {
                 failureStreak = 0;
                 activeEngineMode = MODE_JNI_OFFLINE;
                 processReady = true;
+                notifyReloadOutcome(loadingReloadSeq, true, "applied");
 
                 if (listener != null) {
                     listener.onKwsReady(snapThr, snapScore, snapHash);
@@ -536,6 +769,7 @@ public final class LocalKwsEngine {
                 String lastHitKeyword = "";
                 long streamCreatedMs = System.currentTimeMillis();
                 int consecutiveQuietBlocks = 0;
+                float[] kwsAgcGain = new float[]{KWS_AGC_IDLE_FLOOR_GAIN};
 
                 while (running && !reloadRequested.get() && !Thread.currentThread().isInterrupted()) {
                     PcmBlock block = pcmQueue.poll(120, TimeUnit.MILLISECONDS);
@@ -557,13 +791,8 @@ public final class LocalKwsEngine {
                     }
 
                     byte[] pcm = block.pcm;
-                    int sampleCount = pcm.length / 2;
-                    float[] samples = new float[sampleCount];
-                    for (int i = 0; i < sampleCount; i++) {
-                        int lo = pcm[i * 2] & 0xFF;
-                        int hi = pcm[i * 2 + 1];
-                        samples[i] = (short) ((hi << 8) | lo) / 32768.0f;
-                    }
+                    float[] samples = convertAndNormalizePcmForKws(pcm, kwsAgcGain);
+                    int sampleCount = samples.length;
                     stream.acceptWaveform(samples, 16000);
                     fedSamples += sampleCount;
 
@@ -589,7 +818,7 @@ public final class LocalKwsEngine {
                             int tokenCount = res.getTokens() != null ? res.getTokens().length : 0;
                             boolean isRetreat = isRetreatWord(kw);
                             boolean l2Passed = isRetreat
-                                    || (tokenCount >= 4 && wakeDurMs >= 400L && wakeDurMs <= 1800L && maxGapMs <= 500L);
+                                    || (tokenCount >= 4 && wakeDurMs >= MIN_WAKE_DURATION_MS && wakeDurMs <= 1800L && maxGapMs <= 500L);
                             String tier = l2Passed ? "real" : "suspect";
 
                             detectionCount.incrementAndGet();
@@ -616,6 +845,7 @@ public final class LocalKwsEngine {
                     } catch (IOException ignored) {
                     }
                 }
+                notifyReloadOutcome(loadingReloadSeq, false, "jni_reload_failed:" + t.getMessage());
                 if (listener != null) {
                     listener.onKwsStateChanged("down", "JNI KWS reload error (retrying): " + t.getMessage());
                 }
@@ -765,17 +995,19 @@ public final class LocalKwsEngine {
     }
 
     private File ensureKeywordsFileAndHash() {
-        File kwFile = new File(workDir, "kw.txt");
-        if (!kwFile.exists() || kwFile.length() == 0) {
-            try {
-                writeUtf8Atomically(new File(workDir, "kw.txt.tmp"), kwFile, DEFAULT_KEYWORDS_TXT);
-            } catch (IOException ignored) {
+        synchronized (deployLock) {
+            File kwFile = new File(workDir, "kw.txt");
+            if (!kwFile.exists() || kwFile.length() == 0) {
+                try {
+                    writeUtf8Atomically(new File(workDir, "kw.default.tmp"), kwFile, DEFAULT_KEYWORDS_TXT);
+                } catch (IOException ignored) {
+                }
             }
+            synchronized (this) {
+                currentKeywordsHash = readAndHashKeywordsFile(kwFile);
+            }
+            return kwFile;
         }
-        synchronized (this) {
-            currentKeywordsHash = readAndHashKeywordsFile(kwFile);
-        }
-        return kwFile;
     }
 
     private static String readAndHashKeywordsFile(File kwFile) {
@@ -854,6 +1086,58 @@ public final class LocalKwsEngine {
             }
         }
         return null;
+    }
+
+    /**
+     * Converts raw S16LE PCM bytes to float32 in [-1, 1] and applies gentle KWS-only software
+     * AGC normalization (targeting ~ -20 dBFS, bounded to [1.0x, 3.5x]) so quiet phone mic
+     * capture achieves strong Zipformer wake recall without amplifying uplink ASR noise.
+     */
+    public static float[] convertAndNormalizePcmForKws(byte[] pcm16le, float[] gainState) {
+        if (pcm16le == null || pcm16le.length < 2) {
+            return new float[0];
+        }
+        int sampleCount = pcm16le.length / 2;
+        float[] samples = new float[sampleCount];
+        double sumSq = 0.0;
+        for (int i = 0; i < sampleCount; i++) {
+            int lo = pcm16le[i * 2] & 0xFF;
+            int hi = pcm16le[i * 2 + 1];
+            float s = (short) ((hi << 8) | lo) / 32768.0f;
+            samples[i] = s;
+            sumSq += (double) s * (double) s;
+        }
+        float rms = (float) Math.sqrt(sumSq / Math.max(1, sampleCount));
+        float prevGain = (gainState != null && gainState.length > 0 && gainState[0] >= 1.0f)
+                ? gainState[0] : KWS_AGC_IDLE_FLOOR_GAIN;
+        float nextGain;
+        if (rms >= KWS_AGC_MIN_SPEECH_RMS) {
+            float desired = KWS_AGC_TARGET_RMS / rms;
+            if (desired < 1.0f) {
+                desired = 1.0f;
+            } else if (desired > KWS_AGC_MAX_GAIN) {
+                desired = KWS_AGC_MAX_GAIN;
+            }
+            nextGain = 0.55f * prevGain + 0.45f * desired;
+        } else {
+            // Gently relax toward warm idle floor so opening syllables start boosted without pumping silence
+            nextGain = 0.90f * prevGain + 0.10f * KWS_AGC_IDLE_FLOOR_GAIN;
+        }
+        if (gainState != null && gainState.length > 0) {
+            gainState[0] = nextGain;
+        }
+        if (nextGain > 1.01f) {
+            for (int i = 0; i < sampleCount; i++) {
+                float boosted = samples[i] * nextGain;
+                if (boosted > 0.98f) {
+                    boosted = 0.98f;
+                } else if (boosted < -0.98f) {
+                    boosted = -0.98f;
+                }
+                samples[i] = boosted;
+            }
+        }
+        return samples;
     }
 
     public static long computeWakeDurationMs(float[] timestamps) {

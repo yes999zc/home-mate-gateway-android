@@ -1,7 +1,5 @@
 package homes.mymate.gateway;
 
-import android.content.Context;
-
 /**
  * Pluggable Hardware Adapter abstraction so one universal APK supports standard Android
  * phones/tablets alongside specialized smart speakers (e.g., Phicomm R1).
@@ -12,7 +10,7 @@ public interface HardwareAdapter {
 
     boolean isSpecializedHardwareDetected();
 
-    void attach(Context context, R1HardwareHook.HardwareEventListener listener);
+    void attach();
 
     void syncAssistantLedState(String assistantState, boolean muted, boolean connected);
 
@@ -22,19 +20,16 @@ public interface HardwareAdapter {
         private Factory() {
         }
 
-        public static HardwareAdapter createAndAttach(
-                Context context,
-                boolean allowVendorHooks,
-                R1HardwareHook.HardwareEventListener listener) {
+        public static HardwareAdapter createAndAttach(boolean allowVendorHooks) {
             if (allowVendorHooks) {
                 PhicommR1Adapter r1 = new PhicommR1Adapter();
-                r1.attach(context, listener);
+                r1.attach();
                 if (r1.isSpecializedHardwareDetected()) {
                     return r1;
                 }
             }
             GenericAndroidAdapter generic = new GenericAndroidAdapter();
-            generic.attach(context, listener);
+            generic.attach();
             return generic;
         }
     }
@@ -51,7 +46,7 @@ public interface HardwareAdapter {
         }
 
         @Override
-        public void attach(Context context, R1HardwareHook.HardwareEventListener listener) {
+        public void attach() {
         }
 
         @Override
@@ -77,8 +72,8 @@ public interface HardwareAdapter {
         }
 
         @Override
-        public void attach(Context context, R1HardwareHook.HardwareEventListener listener) {
-            this.hook = new R1HardwareHook(context, listener);
+        public void attach() {
+            this.hook = new R1HardwareHook();
             this.hook.probeAndAttach();
         }
 

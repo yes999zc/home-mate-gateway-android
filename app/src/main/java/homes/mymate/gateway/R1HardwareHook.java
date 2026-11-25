@@ -1,6 +1,5 @@
 package homes.mymate.gateway;
 
-import android.content.Context;
 import android.util.Log;
 
 import java.lang.reflect.Method;
@@ -11,26 +10,15 @@ import java.lang.reflect.Method;
  * When this universal APK runs on a standard Android phone, tablet, 86 wall panel, or smart screen,
  * {@link #isPhicommR1HardwareAvailable()} returns {@code false} and this class is a zero-cost no-op.
  * When installed on a Phicomm R1 speaker, it probes Android's ServiceManager for {@code msgcenter}
- * and honestly reports probe-only status until vendor IPC subscription is active.
+ * and honestly reports probe-only status.
  */
 public final class R1HardwareHook {
 
     private static final String TAG = "HomeMateR1Hook";
-    public static final int MSG_TYPE_WAKEUP = 33554432;
-    public static final int MSG_WHAT_WAKE_TRIGGERED = 4;
 
-    public interface HardwareEventListener {
-        void onHardwareWakeTriggered(String keyword);
-        void onHardwareTopButtonShortPress();
-    }
-
-    private final Context context;
-    private final HardwareEventListener listener;
     private volatile boolean r1Detected = false;
 
-    public R1HardwareHook(Context context, HardwareEventListener listener) {
-        this.context = context.getApplicationContext();
-        this.listener = listener;
+    public R1HardwareHook() {
     }
 
     public boolean probeAndAttach() {

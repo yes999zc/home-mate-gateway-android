@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Locale;
 
 import homes.mymate.gateway.protocol.CoreDiscovery;
+import homes.mymate.gateway.protocol.DeviceRoutingPolicy;
 
 /**
  * Persistent configuration & Multi-Core Profile store for Home Mate Android Client (v2.3.0).
@@ -33,13 +34,14 @@ public final class GatewayConfig {
         public final String bearerToken;
         public final String coreId;
         public final List<String> alternateHosts;
+        public final boolean manageOnly;
 
         public ServerProfile(String name, String host, int gatewayPort, int webPort) {
-            this(name, host, gatewayPort, webPort, "", "", null);
+            this(name, host, gatewayPort, webPort, "", "", null, false);
         }
 
         public ServerProfile(String name, String host, int gatewayPort, int webPort, String bearerToken) {
-            this(name, host, gatewayPort, webPort, bearerToken, "", null);
+            this(name, host, gatewayPort, webPort, bearerToken, "", null, false);
         }
 
         public ServerProfile(
@@ -50,6 +52,18 @@ public final class GatewayConfig {
                 String bearerToken,
                 String coreId,
                 List<String> alternateHosts) {
+            this(name, host, gatewayPort, webPort, bearerToken, coreId, alternateHosts, false);
+        }
+
+        public ServerProfile(
+                String name,
+                String host,
+                int gatewayPort,
+                int webPort,
+                String bearerToken,
+                String coreId,
+                List<String> alternateHosts,
+                boolean manageOnly) {
             this.name = name != null ? name.trim() : "";
             this.host = host != null ? host.trim() : "";
             this.gatewayPort = gatewayPort > 0 ? gatewayPort : 8932;
@@ -68,6 +82,7 @@ public final class GatewayConfig {
                 }
             }
             this.alternateHosts = Collections.unmodifiableList(alts);
+            this.manageOnly = manageOnly;
         }
 
         public boolean matchesHost(String candidateHost) {
@@ -105,7 +120,8 @@ public final class GatewayConfig {
                     + host + "|" + gatewayPort + "|" + webPort + "|"
                     + bearerToken.replace("|", "").replace("\n", "") + "|"
                     + coreId.replace("|", "").replace("\n", "") + "|"
-                    + altCsv.toString();
+                    + altCsv.toString() + "|"
+                    + (manageOnly ? "1" : "0");
         }
 
         public static ServerProfile deserialize(String raw) {
@@ -130,10 +146,12 @@ public final class GatewayConfig {
                     }
                 }
             }
+            boolean manageOnly = parts.length >= 8
+                    && ("1".equals(parts[7].trim()) || "true".equalsIgnoreCase(parts[7].trim()));
             if (host.isEmpty()) {
                 return null;
             }
-            return new ServerProfile(name.isEmpty() ? host : name, host, gw, web, token, cid, alts);
+            return new ServerProfile(name.isEmpty() ? host : name, host, gw, web, token, cid, alts, manageOnly);
         }
     }
 
@@ -143,6 +161,8 @@ public final class GatewayConfig {
     private static final String KEY_CORE_PORT = "core_port";
     private static final String KEY_WEB_PORT = "web_port";
     private static final String KEY_BEARER_TOKEN = "core_bearer_token";
+    private static final String KEY_MANAGE_ONLY = "core_manage_only";
+    private static final String KEY_CONFIG_V2_STATE = "config_v2_state_v1";
     private static final String KEY_PROFILES = "core_profiles_v1";
     private static final String KEY_AUTO_FAILOVER = "auto_failover";
     private static final String KEY_DEVICE_ID = "device_id";
@@ -158,6 +178,9 @@ public final class GatewayConfig {
     private static final String KEY_SOFTWARE_AEC = "software_aec_enabled";
     private static final String KEY_SOFTWARE_AEC_V2_MIGRATED = "software_aec_v2_migrated";
     private static final String KEY_UPLINK_GAIN_V23_MIGRATED = "uplink_gain_v23_migrated";
+    private static final String KEY_DESIRED_MUTED = "desired_muted";
+    private static final String KEY_KWS_V232_MIGRATED = "kws_v232_migrated";
+    private static final String KEY_KWS_V239_RESTORED = "kws_v239_restored";
     private static final String KEY_UPLINK_GAIN = "uplink_gain";
     private static final String KEY_KWS_THRESHOLD = "kws_threshold";
     private static final String KEY_KWS_SCORE = "kws_score";
@@ -209,6 +232,36 @@ public final class GatewayConfig {
             dirty = true;
         }
 
+        // v2.3.2 migration: upgrade untouched old 0.28 / 2.60 KWS defaults to mobile-tuned 0.22 / 3.00
+        if (!prefs.getBoolean(KEY_KWS_V232_MIGRATED, false)) {
+            if (prefs.contains(KEY_KWS_THRESHOLD) && prefs.contains(KEY_KWS_SCORE)) {
+                float curThr = prefs.getFloat(KEY_KWS_THRESHOLD, 0.22f);
+                float curSc = prefs.getFloat(KEY_KWS_SCORE, 3.00f);
+                if (Math.abs(curThr - 0.28f) < 0.015f && Math.abs(curSc - 2.60f) < 0.05f) {
+                    ed.putFloat(KEY_KWS_THRESHOLD, 0.22f);
+                    ed.putFloat(KEY_KWS_SCORE, 3.00f);
+                }
+            }
+            ed.putBoolean(KEY_KWS_V232_MIGRATED, true);
+            dirty = true;
+        }
+
+        // v2.3.9 migration: restore mobile-calibrated 0.22 / 3.00 if v2.3.7/v2.3.8 persisted
+        // Core's generic Dot2 7-mic default (0.32 / 2.50) onto this Android device.
+        if (!prefs.getBoolean(KEY_KWS_V239_RESTORED, false)) {
+            if (prefs.contains(KEY_KWS_THRESHOLD) && prefs.contains(KEY_KWS_SCORE)) {
+                float curThr = prefs.getFloat(KEY_KWS_THRESHOLD, DeviceRoutingPolicy.MOBILE_CALIBRATED_KWS_THRESHOLD);
+                float curSc = prefs.getFloat(KEY_KWS_SCORE, DeviceRoutingPolicy.MOBILE_CALIBRATED_KWS_SCORE);
+                float[] migrated = DeviceRoutingPolicy.migrateClobberedDot2KwsSensitivity(curThr, curSc);
+                if (migrated[0] != curThr || migrated[1] != curSc) {
+                    ed.putFloat(KEY_KWS_THRESHOLD, migrated[0]);
+                    ed.putFloat(KEY_KWS_SCORE, migrated[1]);
+                }
+            }
+            ed.putBoolean(KEY_KWS_V239_RESTORED, true);
+            dirty = true;
+        }
+
         if (dirty) {
             ed.apply();
         }
@@ -256,7 +309,7 @@ public final class GatewayConfig {
         List<ServerProfile> updated = new ArrayList<ServerProfile>();
         for (ServerProfile p : list) {
             if (p.matchesHost(activeHost)) {
-                updated.add(new ServerProfile(p.name, p.host, p.gatewayPort, p.webPort, clean, p.coreId, p.alternateHosts));
+                updated.add(new ServerProfile(p.name, p.host, p.gatewayPort, p.webPort, clean, p.coreId, p.alternateHosts, p.manageOnly));
                 changed = true;
             } else {
                 updated.add(p);
@@ -267,12 +320,81 @@ public final class GatewayConfig {
         }
     }
 
+    /**
+     * Returns whether the currently active Core profile is explicitly configured as Manage-Only
+     * (HTTP :8930 only, no Northbound :8932 Voice Gateway). Defaults to {@code false} (Voice Gateway).
+     */
+    public boolean isManageOnly() {
+        String activeHost = getCoreHost();
+        if (!activeHost.isEmpty()) {
+            for (ServerProfile p : getServerProfiles()) {
+                if (p.matchesHost(activeHost)) {
+                    return p.manageOnly;
+                }
+            }
+        }
+        return prefs.getBoolean(KEY_MANAGE_ONLY, false);
+    }
+
+    public void setManageOnly(boolean manageOnly) {
+        prefs.edit().putBoolean(KEY_MANAGE_ONLY, manageOnly).apply();
+        String activeHost = getCoreHost();
+        if (activeHost.isEmpty()) {
+            return;
+        }
+        List<ServerProfile> list = getServerProfiles();
+        List<ServerProfile> updated = new ArrayList<ServerProfile>();
+        boolean changed = false;
+        for (ServerProfile p : list) {
+            if (p.matchesHost(activeHost)) {
+                updated.add(new ServerProfile(
+                        p.name, p.host, p.gatewayPort, p.webPort,
+                        p.bearerToken, p.coreId, p.alternateHosts, manageOnly));
+                changed = true;
+            } else {
+                updated.add(p);
+            }
+        }
+        if (changed) {
+            saveServerProfiles(updated);
+        }
+    }
+
+    private String activeConfigV2StatePrefKey() {
+        String cid = getActiveCoreId();
+        if (cid != null && !cid.isEmpty()) {
+            return KEY_CONFIG_V2_STATE + "_id_" + cid.toLowerCase(Locale.US);
+        }
+        String host = getCoreHost();
+        if (host == null || host.isEmpty()) {
+            return KEY_CONFIG_V2_STATE;
+        }
+        return KEY_CONFIG_V2_STATE + "_host_" + host.toLowerCase(Locale.US) + "_" + getCorePort();
+    }
+
+    public String getConfigV2StateJson() {
+        String raw = prefs.getString(activeConfigV2StatePrefKey(), "");
+        return raw != null ? raw : "";
+    }
+
+    public void setConfigV2StateJson(String json) {
+        prefs.edit().putString(activeConfigV2StatePrefKey(), json != null ? json : "").apply();
+    }
+
     public boolean isAutoFailoverEnabled() {
         return prefs.getBoolean(KEY_AUTO_FAILOVER, true);
     }
 
     public void setAutoFailoverEnabled(boolean enabled) {
         prefs.edit().putBoolean(KEY_AUTO_FAILOVER, enabled).apply();
+    }
+
+    public boolean isDesiredMuted() {
+        return prefs.getBoolean(KEY_DESIRED_MUTED, false);
+    }
+
+    public void setDesiredMuted(boolean muted) {
+        prefs.edit().putBoolean(KEY_DESIRED_MUTED, muted).apply();
     }
 
     public List<ServerProfile> getServerProfiles() {
@@ -317,6 +439,18 @@ public final class GatewayConfig {
             String bearerToken,
             String coreId,
             List<String> alternateHosts) {
+        upsertProfileAndSelect(name, host, gwPort, webPort, bearerToken, coreId, alternateHosts, null);
+    }
+
+    public void upsertProfileAndSelect(
+            String name,
+            String host,
+            int gwPort,
+            int webPort,
+            String bearerToken,
+            String coreId,
+            List<String> alternateHosts,
+            Boolean manageOnly) {
         String cleanHost = host != null ? host.trim() : "";
         if (cleanHost.isEmpty()) {
             return;
@@ -326,27 +460,31 @@ public final class GatewayConfig {
         List<ServerProfile> updated = new ArrayList<ServerProfile>();
         boolean replaced = false;
         String resolvedToken = bearerToken != null ? bearerToken.trim() : "";
+        boolean resolvedManageOnly = manageOnly != null && manageOnly.booleanValue();
         for (ServerProfile p : list) {
-            boolean sameCore = !cleanCoreId.isEmpty() && !p.coreId.isEmpty()
-                    && p.coreId.equalsIgnoreCase(cleanCoreId);
+            // Security (P0-1): NEVER match an existing profile solely by unauthenticated core_id,
+            // which would inherit its saved bearerToken onto an untrusted host.
             boolean sameHost = p.matchesHost(cleanHost);
-            if (!replaced && (sameCore || sameHost)) {
+            if (!replaced && sameHost) {
                 String tok = bearerToken != null ? bearerToken.trim() : p.bearerToken;
                 resolvedToken = tok;
-                String finalCid = !cleanCoreId.isEmpty() ? cleanCoreId : p.coreId;
+                resolvedManageOnly = manageOnly != null ? manageOnly.booleanValue() : p.manageOnly;
+                String finalCid = (!cleanCoreId.isEmpty() && p.coreId.isEmpty() && p.bearerToken.isEmpty())
+                        ? cleanCoreId
+                        : p.coreId;
                 List<String> mergedAlts = mergeAltHosts(cleanHost, p.host, p.alternateHosts, alternateHosts);
                 updated.add(new ServerProfile(
                         name != null && !name.trim().isEmpty() ? name.trim() : p.name,
-                        cleanHost, gwPort, webPort, tok, finalCid, mergedAlts));
+                        cleanHost, gwPort, webPort, tok, finalCid, mergedAlts, resolvedManageOnly));
                 replaced = true;
-            } else if (!(sameCore || sameHost)) {
+            } else if (!sameHost) {
                 updated.add(p);
             }
         }
         if (!replaced) {
             updated.add(new ServerProfile(
                     name != null && !name.trim().isEmpty() ? name.trim() : cleanHost,
-                    cleanHost, gwPort, webPort, resolvedToken, cleanCoreId, alternateHosts));
+                    cleanHost, gwPort, webPort, resolvedToken, cleanCoreId, alternateHosts, resolvedManageOnly));
         }
         saveServerProfiles(updated);
         prefs.edit()
@@ -354,11 +492,12 @@ public final class GatewayConfig {
                 .putInt(KEY_CORE_PORT, gwPort > 0 ? gwPort : 8932)
                 .putInt(KEY_WEB_PORT, webPort > 0 ? webPort : 8930)
                 .putString(KEY_BEARER_TOKEN, resolvedToken)
+                .putBoolean(KEY_MANAGE_ONLY, resolvedManageOnly)
                 .apply();
     }
 
     /**
-     * Updates an existing server profile (supports renaming, changing IP/host, ports, or Bearer token).
+     * Updates an existing server profile (supports renaming, changing IP/host, ports, Bearer token, or mode).
      */
     public void updateServerProfile(
             String originalHost,
@@ -367,6 +506,17 @@ public final class GatewayConfig {
             int gwPort,
             int webPort,
             String bearerToken) {
+        updateServerProfile(originalHost, newName, newHost, gwPort, webPort, bearerToken, null);
+    }
+
+    public void updateServerProfile(
+            String originalHost,
+            String newName,
+            String newHost,
+            int gwPort,
+            int webPort,
+            String bearerToken,
+            Boolean manageOnly) {
         String cleanNewHost = newHost != null ? newHost.trim() : "";
         if (cleanNewHost.isEmpty()) {
             return;
@@ -377,14 +527,19 @@ public final class GatewayConfig {
         String activeHost = getCoreHost();
         boolean wasActive = originalHost != null && originalHost.trim().equalsIgnoreCase(activeHost);
         boolean found = false;
+        boolean resolvedManageOnly = manageOnly != null && manageOnly.booleanValue();
         for (ServerProfile p : list) {
             if (!found && originalHost != null && p.matchesHost(originalHost.trim())) {
                 if (p.matchesHost(activeHost)) {
                     wasActive = true;
                 }
+                resolvedManageOnly = manageOnly != null ? manageOnly.booleanValue() : p.manageOnly;
+                boolean hostChanged = !p.matchesHost(cleanNewHost);
+                String nextCoreId = hostChanged ? "" : p.coreId;
+                List<String> nextAltHosts = hostChanged ? null : p.alternateHosts;
                 updated.add(new ServerProfile(
                         newName != null && !newName.trim().isEmpty() ? newName.trim() : cleanNewHost,
-                        cleanNewHost, gwPort, webPort, cleanTok, p.coreId, p.alternateHosts));
+                        cleanNewHost, gwPort, webPort, cleanTok, nextCoreId, nextAltHosts, resolvedManageOnly));
                 found = true;
             } else if (!p.host.equalsIgnoreCase(cleanNewHost)) {
                 updated.add(p);
@@ -393,7 +548,7 @@ public final class GatewayConfig {
         if (!found) {
             updated.add(new ServerProfile(
                     newName != null && !newName.trim().isEmpty() ? newName.trim() : cleanNewHost,
-                    cleanNewHost, gwPort, webPort, cleanTok, "", null));
+                    cleanNewHost, gwPort, webPort, cleanTok, "", null, resolvedManageOnly));
             wasActive = true;
         }
         saveServerProfiles(updated);
@@ -403,6 +558,7 @@ public final class GatewayConfig {
                     .putInt(KEY_CORE_PORT, gwPort > 0 ? gwPort : 8932)
                     .putInt(KEY_WEB_PORT, webPort > 0 ? webPort : 8930)
                     .putString(KEY_BEARER_TOKEN, cleanTok)
+                    .putBoolean(KEY_MANAGE_ONLY, resolvedManageOnly)
                     .apply();
         }
     }
@@ -439,11 +595,13 @@ public final class GatewayConfig {
                         .putInt(KEY_CORE_PORT, next.gatewayPort)
                         .putInt(KEY_WEB_PORT, next.webPort)
                         .putString(KEY_BEARER_TOKEN, next.bearerToken)
+                        .putBoolean(KEY_MANAGE_ONLY, next.manageOnly)
                         .apply();
             } else {
                 prefs.edit()
                         .putString(KEY_CORE_HOST, "")
                         .putString(KEY_BEARER_TOKEN, "")
+                        .putBoolean(KEY_MANAGE_ONLY, false)
                         .apply();
             }
         }
@@ -506,19 +664,55 @@ public final class GatewayConfig {
         return "";
     }
 
+    public String getActiveCoreId() {
+        String activeHost = getCoreHost();
+        if (activeHost == null || activeHost.trim().isEmpty()) {
+            return "";
+        }
+        for (ServerProfile p : getServerProfiles()) {
+            if (p.matchesHost(activeHost) && p.coreId != null && !p.coreId.isEmpty()) {
+                return p.coreId;
+            }
+        }
+        return "";
+    }
+
+    public boolean activeProfileMatchesHost(String host) {
+        if (host == null || host.trim().isEmpty()) {
+            return false;
+        }
+        String h = host.trim();
+        String activeHost = getCoreHost();
+        if (h.equalsIgnoreCase(activeHost)) {
+            return true;
+        }
+        for (ServerProfile p : getServerProfiles()) {
+            if (p.matchesHost(activeHost) && p.matchesHost(h)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public void setProfileBearerToken(String host, String token) {
+        setProfileBearerToken(host, token, null);
+    }
+
+    public void setProfileBearerToken(String host, String token, String verifiedCoreId) {
         if (host == null || host.trim().isEmpty()) {
             return;
         }
         String h = host.trim();
         String clean = token != null ? token.trim() : "";
+        String cleanCid = verifiedCoreId != null ? verifiedCoreId.trim() : "";
         List<ServerProfile> list = getServerProfiles();
         List<ServerProfile> updated = new ArrayList<ServerProfile>();
         boolean found = false;
         boolean matchesActive = h.equalsIgnoreCase(getCoreHost());
         for (ServerProfile p : list) {
             if (p.matchesHost(h)) {
-                updated.add(new ServerProfile(p.name, p.host, p.gatewayPort, p.webPort, clean, p.coreId, p.alternateHosts));
+                String pinnedCid = DeviceRoutingPolicy.resolvePinnedCoreId(p.coreId, cleanCid);
+                updated.add(new ServerProfile(p.name, p.host, p.gatewayPort, p.webPort, clean, pinnedCid, p.alternateHosts, p.manageOnly));
                 if (p.matchesHost(getCoreHost())) {
                     matchesActive = true;
                 }
@@ -528,7 +722,7 @@ public final class GatewayConfig {
             }
         }
         if (!found) {
-            updated.add(new ServerProfile(h, h, 8932, 8930, clean, "", null));
+            updated.add(new ServerProfile(h, h, 8932, 8930, clean, cleanCid, null, false));
         }
         saveServerProfiles(updated);
         if (matchesActive) {
@@ -537,65 +731,66 @@ public final class GatewayConfig {
     }
 
     /**
-     * Merges auto-discovered LAN Cores into saved profiles with {@code core_id} deduplication.
-     * Collapses LAN + Tailscale endpoints sharing the same {@code coreId} into one profile (preferring
-     * RFC1918 LAN primary and keeping secondary endpoints in {@code alternateHosts}), preserves custom
-     * names & Bearer tokens, and auto-selects the first discovered Core when unconfigured.
+     * Merges auto-discovered LAN Cores into saved profiles with strict credential isolation (P0-1):
+     * - NEVER attaches an existing profile's {@code bearerToken} to a newly discovered host, and
+     *   NEVER overwrites {@code primaryHost}, {@code gatewayPort}, {@code webPort}, or {@code alternateHosts}
+     *   of a paired profile solely via an unauthenticated {@code core_id} claim.
+     * - Only updates an existing profile on exact host match (filling an empty {@code coreId} on first sight).
+     * - Newly discovered hosts are added as unauthenticated profiles ({@code bearerToken = ""}) so the user
+     *   explicitly confirms/pairs any new route before credentials are ever transmitted to it.
      */
     public synchronized int mergeDiscoveredCores(List<CoreDiscovery.DiscoveredCore> cores) {
         if (cores == null || cores.isEmpty()) {
             return 0;
         }
-        List<CoreDiscovery.DiscoveredCore> deduped = CoreDiscovery.deduplicateByCoreId(cores);
+        // Security (P0-1): deduplicate discovered candidates strictly by exact host (NOT by
+        // unauthenticated core_id) so a rogue LAN beacon claiming a real Tailscale Core's core_id
+        // can never absorb or poison that Core's primaryHost or alternateHosts.
+        List<CoreDiscovery.DiscoveredCore> deduped = new ArrayList<CoreDiscovery.DiscoveredCore>();
+        java.util.Set<String> seenHosts = new java.util.LinkedHashSet<String>();
+        for (CoreDiscovery.DiscoveredCore c : cores) {
+            if (c == null || c.host == null || c.host.trim().isEmpty()) {
+                continue;
+            }
+            String key = c.host.trim().toLowerCase(java.util.Locale.US);
+            if (seenHosts.add(key)) {
+                deduped.add(c);
+            }
+        }
         List<ServerProfile> merged = new ArrayList<ServerProfile>(getServerProfiles());
         int added = 0;
         boolean changed = false;
 
         for (CoreDiscovery.DiscoveredCore c : deduped) {
-            if (c == null || c.host == null || c.host.trim().isEmpty()) {
-                continue;
-            }
-            int matchIdx = -1;
+            String discoveredHost = c.host.trim();
+            int hostMatchIdx = -1;
             for (int i = 0; i < merged.size(); i++) {
                 ServerProfile p = merged.get(i);
-                boolean byCoreId = !c.coreId.isEmpty() && !p.coreId.isEmpty()
-                        && p.coreId.equalsIgnoreCase(c.coreId);
-                boolean byHost = p.matchesHost(c.host);
-                if (!byHost) {
-                    for (String alt : c.alternateHosts) {
-                        if (p.matchesHost(alt)) {
-                            byHost = true;
-                            break;
-                        }
-                    }
-                }
-                if (byCoreId || byHost) {
-                    matchIdx = i;
+                if (p.matchesHost(discoveredHost)) {
+                    hostMatchIdx = i;
                     break;
                 }
             }
-            if (matchIdx < 0) {
+            if (hostMatchIdx < 0) {
+                // Never merge an unauthenticated host into an existing paired profile by core_id alone,
+                // and never inherit another profile's bearerToken.
                 merged.add(new ServerProfile(
-                        c.displayLabel(), c.host.trim(), c.gatewayPort, c.webPort,
-                        "", c.coreId, c.alternateHosts));
+                        c.displayLabel(), discoveredHost, c.gatewayPort, c.webPort,
+                        "", c.coreId, Collections.<String>emptyList(), !c.voiceGatewayOpen));
                 added++;
                 changed = true;
             } else {
-                ServerProfile existing = merged.get(matchIdx);
-                // Prefer RFC1918 LAN primary over Tailscale when the same Core is discovered on LAN
-                boolean upgradePrimary = CoreDiscovery.hostRouteRank(c.host) < CoreDiscovery.hostRouteRank(existing.host);
-                String primaryHost = upgradePrimary ? c.host : existing.host;
-                List<String> alts = mergeAltHosts(
-                        primaryHost,
-                        upgradePrimary ? existing.host : c.host,
-                        existing.alternateHosts,
-                        c.alternateHosts);
-                String finalCoreId = !c.coreId.isEmpty() ? c.coreId : existing.coreId;
-                ServerProfile next = new ServerProfile(
-                        existing.name, primaryHost, c.gatewayPort, c.webPort,
-                        existing.bearerToken, finalCoreId, alts);
-                if (!next.serialize().equals(existing.serialize())) {
-                    merged.set(matchIdx, next);
+                ServerProfile existing = merged.get(hostMatchIdx);
+                // Exact host match: preserve primaryHost, ports, alternateHosts, bearerToken, and manageOnly.
+                // NEVER pin an unauthenticated core_id onto an already-paired profile; only fill
+                // coreId on an unpaired profile whose coreId was previously unknown.
+                String finalCoreId = (existing.coreId.isEmpty() && existing.bearerToken.isEmpty() && !c.coreId.isEmpty())
+                        ? c.coreId
+                        : existing.coreId;
+                if (!finalCoreId.equals(existing.coreId)) {
+                    merged.set(hostMatchIdx, new ServerProfile(
+                            existing.name, existing.host, existing.gatewayPort, existing.webPort,
+                            existing.bearerToken, finalCoreId, existing.alternateHosts, existing.manageOnly));
                     changed = true;
                 }
             }
@@ -611,6 +806,7 @@ public final class GatewayConfig {
                     .putInt(KEY_CORE_PORT, best.gatewayPort)
                     .putInt(KEY_WEB_PORT, best.webPort)
                     .putString(KEY_BEARER_TOKEN, getBearerTokenForHost(best.host))
+                    .putBoolean(KEY_MANAGE_ONLY, !best.voiceGatewayOpen)
                     .apply();
         }
         return added;
@@ -663,11 +859,11 @@ public final class GatewayConfig {
     }
 
     public float getKwsThreshold() {
-        return prefs.getFloat(KEY_KWS_THRESHOLD, 0.28f);
+        return prefs.getFloat(KEY_KWS_THRESHOLD, 0.22f);
     }
 
     public float getKwsScore() {
-        return prefs.getFloat(KEY_KWS_SCORE, 2.60f);
+        return prefs.getFloat(KEY_KWS_SCORE, 3.00f);
     }
 
     public boolean isAutoStartOnBoot() {
@@ -695,11 +891,7 @@ public final class GatewayConfig {
         if (custom != null && !custom.trim().isEmpty()) {
             return custom.trim();
         }
-        String host = getCoreHost();
-        if (host.isEmpty()) {
-            return "";
-        }
-        return "http://" + host + ":8931";
+        return homes.mymate.gateway.protocol.ReleaseUpdater.DEFAULT_GITHUB_RELEASES_API;
     }
 
     public void setUpdateServerUrl(String url) {

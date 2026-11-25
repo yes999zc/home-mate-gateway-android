@@ -3,6 +3,7 @@ package homes.mymate.gateway;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.DialogInterface;
@@ -12,6 +13,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -21,11 +23,13 @@ import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
@@ -33,6 +37,7 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -45,13 +50,17 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import homes.mymate.gateway.protocol.CoreApiClient;
 import homes.mymate.gateway.protocol.CoreDiscovery;
+import homes.mymate.gateway.protocol.DeviceRoutingPolicy;
 
 /**
  * Home Mate Android Universal Client v2.2.0 — Apple Design Language (Light / Dark / System Dual Theme)
@@ -83,7 +92,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private boolean standByActive = false;
     private boolean imeVisible = false;
     private boolean musicStageMode = false;
-    private AlertDialog activeDialog;
+    private Dialog activeDialog;
 
     // Root shell
     private FrameLayout rootFrame;
@@ -124,6 +133,10 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private LinearLayout musicTransportDock;
     private TextView tvMusicTitle;
     private TextView tvMusicSub;
+    private ImageView btnMusicPlayPause;
+    private ImageView btnMusicMute;
+    private boolean lastMusicPlayPauseRenderedPlaying = true;
+    private String lastPromptedConfirmationId = "";
 
     // Ultra-slim Dialogue Ticker & Capsule Composer
     private LinearLayout voiceFooterDock;
@@ -132,10 +145,15 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private EditText etComposer;
 
     // Rooms & Whole-Home Fleet widgets
+    private TextView tvRoomsSectionTitle;
+    private LinearLayout roomsHeaderActions;
     private LinearLayout wholeHomeRoomsContainer;
+    private LinearLayout roomsActiveControlsSection;
+    private LinearLayout roomsArbSection;
+    private LinearLayout roomsDetailsBody;
+    private ImageView ivRoomsDetailsChevron;
+    private boolean roomsDetailsExpanded = false;
     private LinearLayout devicesListContainer;
-    private View fleetSectionHeading;
-    private LinearLayout fleetListContainer;
     private TextView tvModeDuplexHalf;
     private TextView tvModeDuplexFull;
     private Switch swBargeIn;
@@ -154,6 +172,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private FrameLayout webViewHost;
     private WebView webView;
     private String lastLoadedWebUrl = "";
+    private String lastLoadedWebToken = "";
 
     // Settings widgets
     private LinearLayout profilesContainer;
@@ -170,7 +189,6 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     // Diff fingerprints
     private String lastTranscriptFingerprint = "";
     private String lastDevicesFingerprint = "";
-    private String lastFleetFingerprint = "";
     private List<CoreApiClient.ChatEntry> latestCleanTranscript = new ArrayList<CoreApiClient.ChatEntry>();
 
     // Coalesced single-Runnable UI refresh
@@ -199,6 +217,12 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         }
     };
 
+    // Queued LAN scan tap if user taps scan before GatewayService finishes binding (0=none, 1=dialog, 2=rooms)
+    private static final int PENDING_LAN_SCAN_NONE = 0;
+    private static final int PENDING_LAN_SCAN_DIALOG = 1;
+    private static final int PENDING_LAN_SCAN_ROOMS = 2;
+    private int pendingLanScanAction = PENDING_LAN_SCAN_NONE;
+
     private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
@@ -207,9 +231,17 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             serviceBound = true;
             gatewayService.setUiTelemetryListener(MainActivity.this);
             gatewayService.setLiveEnergyListener(liveEnergyListener);
+            gatewayService.ensureCaptureRunningIfPermitted();
             scheduleUiRefresh();
             if (activeTab == TAB_ROOMS) {
                 refreshWholeHomeRoomCards();
+            }
+            int queuedScan = pendingLanScanAction;
+            pendingLanScanAction = PENDING_LAN_SCAN_NONE;
+            if (queuedScan == PENDING_LAN_SCAN_DIALOG) {
+                runLanScanWithDialog(false);
+            } else if (queuedScan == PENDING_LAN_SCAN_ROOMS) {
+                scanLanAndRefreshRooms(false);
             }
         }
 
@@ -250,6 +282,9 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         super.onResume();
         if (webView != null) {
             webView.onResume();
+        }
+        if (gatewayService != null) {
+            gatewayService.ensureCaptureRunningIfPermitted();
         }
         if (tvBatteryStatus != null) {
             tvBatteryStatus.setText(isIgnoringBatteryOptimizations()
@@ -335,7 +370,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private String tr(String key) { return I18n.t(lang(), key); }
     private int dp(int v) { return UiTheme.dp(this, v); }
 
-    private void showTrackedDialog(AlertDialog dialog) {
+    private void showTrackedDialog(Dialog dialog) {
         if (isFinishing() || isDestroyed()) return;
         dismissActiveDialog();
         activeDialog = dialog;
@@ -420,7 +455,6 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
 
         lastTranscriptFingerprint = "";
         lastDevicesFingerprint = "";
-        lastFleetFingerprint = "";
         lastDotColor = 0;
         lastMuteRendered = false;
         musicStageMode = false;
@@ -473,10 +507,14 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
 
         standByOverlay = new StandByOverlayView(this, lang(), deviceProfile.compactSquare, new StandByOverlayView.Callback() {
             @Override public void onExitStandBy() { setStandByVisible(false); }
-            @Override public void onTapWake() { if (gatewayService != null) gatewayService.triggerManualWake("你好小智"); }
-            @Override public void onLongPressRetreat() { if (gatewayService != null) gatewayService.triggerManualRetreat("退下"); }
+            @Override public void onTapWake() {
+                if (gatewayService != null) {
+                    gatewayService.triggerManualWake(gatewayService.resolvePreferredWakeKeyword());
+                }
+            }
+            @Override public void onLongPressRetreat() { if (gatewayService != null) gatewayService.triggerManualRetreat(null); }
             @Override public void onMediaNext() { if (gatewayService != null) gatewayService.triggerMediaCommand("下一首"); }
-            @Override public void onMediaTogglePause() { if (gatewayService != null) gatewayService.triggerMediaCommand("暂停播放"); }
+            @Override public void onMediaTogglePause() { triggerMusicPlayPauseToggle(); }
         });
         standByOverlay.setVisibility(standByActive ? View.VISIBLE : View.GONE);
         rootFrame.addView(standByOverlay, new FrameLayout.LayoutParams(
@@ -875,7 +913,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             public void onClick(View v) {
                 if (gatewayService == null) return;
                 if (gatewayService.isConnected()) {
-                    gatewayService.triggerManualWake("你好小智");
+                    gatewayService.triggerManualWake(gatewayService.resolvePreferredWakeKeyword());
                 } else if (etComposer != null) {
                     etComposer.requestFocus();
                 }
@@ -929,7 +967,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                     public void onClick(View v) {
                         if (heroOrb != null) heroOrb.triggerShockwave();
                         if (gatewayService != null && gatewayService.isConnected()) {
-                            gatewayService.triggerManualWake("你好小智");
+                            gatewayService.triggerManualWake(gatewayService.resolvePreferredWakeKeyword());
                         } else if (etComposer != null) {
                             etComposer.requestFocus();
                         }
@@ -966,12 +1004,21 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
 
     private void triggerStopActiveCore() {
         if (gatewayService == null) return;
-        if (gatewayService.isConnected()) {
-            gatewayService.triggerManualRetreat("退下");
+        boolean manageOnly = gatewayService.isManageOnlyMode();
+        DeviceRoutingPolicy.StopRoute route = DeviceRoutingPolicy.resolveActiveCoreStopRoute(
+                manageOnly, gatewayService.isConnected());
+        if (route == DeviceRoutingPolicy.StopRoute.LOCAL_RETREAT_NORTHBOUND) {
+            gatewayService.triggerManualRetreat(null);
+        } else if (route == DeviceRoutingPolicy.StopRoute.MANAGE_ONLY_REMOTE_STOP) {
+            String devId = DeviceRoutingPolicy.resolvePrimaryRemoteDeviceId(true, gatewayService.getCoreSnapshot());
+            if (!devId.isEmpty()) {
+                gatewayService.stopRemoteRoomAsync(config.getCoreHost(), config.getWebPort(), devId, null);
+            }
         } else {
-            CoreApiClient.CoreSnapshot snap = gatewayService.getCoreSnapshot();
-            String devId = (snap != null && !snap.devices.isEmpty()) ? snap.devices.get(0).id : "";
-            gatewayService.stopRemoteRoomAsync(config.getCoreHost(), config.getWebPort(), devId, null);
+            // Voice Gateway transiently disconnected: flush any local audio only;
+            // never target a sibling speaker or fall back to unbound /api/v0/chat.
+            gatewayService.triggerManualRetreat(null);
+            Toast.makeText(this, tr("voice_disconnected_reconnect"), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -1020,14 +1067,16 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                 }));
         bar.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
 
-        bar.addView(UiTheme.circleIconButton(this, theme, Icons.Name.PAUSE, theme.primaryFg,
+        btnMusicPlayPause = UiTheme.circleIconButton(this, theme, Icons.Name.PAUSE, theme.primaryFg,
                 theme.primaryBg, 0, 50,
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
-                        if (gatewayService != null) gatewayService.triggerMediaCommand("暂停播放");
+                        triggerMusicPlayPauseToggle();
                     }
-                }));
+                });
+        lastMusicPlayPauseRenderedPlaying = true;
+        bar.addView(btnMusicPlayPause);
         bar.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
 
         bar.addView(UiTheme.circleIconButton(this, theme, Icons.Name.SKIP_NEXT, theme.textPrimary,
@@ -1046,6 +1095,17 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                     @Override
                     public void onClick(View v) { triggerStopActiveCore(); }
                 }));
+        bar.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
+
+        btnMusicMute = UiTheme.circleIconButton(this, theme, Icons.Name.MIC_OFF, theme.textSecondary,
+                theme.bgElevated, theme.borderSubtle, 44,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (gatewayService != null) gatewayService.toggleMute();
+                    }
+                });
+        bar.addView(btnMusicMute);
 
         dock.addView(bar, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -1120,26 +1180,46 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         return footer;
     }
 
-    private void updateMusicStagePresentation(boolean musicActive, String musicTitle, String musicSource) {
+    private void triggerMusicPlayPauseToggle() {
+        if (gatewayService == null) {
+            return;
+        }
+        CoreApiClient.CoreSnapshot snap = gatewayService.getCoreSnapshot();
+        boolean playingNow = gatewayService.isLocalMediaPlaying()
+                || (snap != null && snap.musicActive);
+        gatewayService.triggerMediaCommand(playingNow ? "暂停播放" : "继续播放");
+    }
+
+    private void updateMusicStagePresentation(
+            boolean musicActive, boolean musicPaused, String musicTitle, String musicSource) {
         if (heroOrb == null || musicTransportDock == null || voiceFooterDock == null) {
             return;
         }
-        if (musicActive) {
+        boolean showMusicDock = musicActive || musicPaused;
+        if (btnMusicPlayPause != null && musicActive != lastMusicPlayPauseRenderedPlaying) {
+            lastMusicPlayPauseRenderedPlaying = musicActive;
+            btnMusicPlayPause.setImageDrawable(Icons.of(
+                    musicActive ? Icons.Name.PAUSE : Icons.Name.PLAY,
+                    theme.primaryFg,
+                    dp(20)));
+        }
+        if (showMusicDock) {
             String title = (musicTitle != null && !musicTitle.trim().isEmpty()) ? musicTitle.trim() : tr("state_music");
             setTextIfChanged(tvMusicTitle, title);
+            String prefix = musicActive ? tr("now_playing") : tr("music_paused");
             String sub = (musicSource != null && !musicSource.trim().isEmpty())
-                    ? tr("now_playing") + " · " + musicSource.trim()
-                    : tr("now_playing");
+                    ? prefix + " · " + musicSource.trim()
+                    : prefix;
             setTextIfChanged(tvMusicSub, sub);
         }
 
-        if (musicActive == musicStageMode) {
+        if (showMusicDock == musicStageMode) {
             return;
         }
-        musicStageMode = musicActive;
+        musicStageMode = showMusicDock;
 
         int targetOrbDp;
-        if (musicActive) {
+        if (showMusicDock) {
             targetOrbDp = deviceProfile.compactSquare ? 188 : (deviceProfile.dualPane ? 336 : 300);
         } else {
             targetOrbDp = deviceProfile.compactSquare ? 156 : (deviceProfile.dualPane ? 268 : 236);
@@ -1152,68 +1232,512 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         }
 
         if (voiceActionRow != null) {
-            voiceActionRow.setVisibility(musicActive ? View.GONE : View.VISIBLE);
+            voiceActionRow.setVisibility(showMusicDock ? View.GONE : View.VISIBLE);
         }
         if (tvOrbState != null) {
-            tvOrbState.setVisibility(musicActive ? View.GONE : View.VISIBLE);
+            tvOrbState.setVisibility(showMusicDock ? View.GONE : View.VISIBLE);
         }
-        musicTransportDock.setVisibility(musicActive ? View.VISIBLE : View.GONE);
-        voiceFooterDock.setVisibility(musicActive ? View.GONE : View.VISIBLE);
+        musicTransportDock.setVisibility(showMusicDock ? View.VISIBLE : View.GONE);
+        // Keep the compact text composer reachable during Music Stage (including Manage-Only
+        // Orb tap focus), collapsing only the dialogue ticker to preserve visual breathing room.
+        if (tickerScroll != null) {
+            tickerScroll.setVisibility(showMusicDock ? View.GONE : View.VISIBLE);
+        }
+        voiceFooterDock.setVisibility(View.VISIBLE);
+    }
+
+    private String formatChatTimestamp(long tsMs, boolean includeDateIfOlder) {
+        if (tsMs <= 0L) {
+            return "";
+        }
+        Date d = new Date(tsMs);
+        if (includeDateIfOlder) {
+            Calendar nowCal = Calendar.getInstance();
+            Calendar msgCal = Calendar.getInstance();
+            msgCal.setTimeInMillis(tsMs);
+            boolean sameDay = nowCal.get(Calendar.YEAR) == msgCal.get(Calendar.YEAR)
+                    && nowCal.get(Calendar.DAY_OF_YEAR) == msgCal.get(Calendar.DAY_OF_YEAR);
+            if (!sameDay) {
+                return new SimpleDateFormat("MM-dd HH:mm", Locale.US).format(d);
+            }
+        }
+        return new SimpleDateFormat("HH:mm", Locale.US).format(d);
     }
 
     private void showConversationHistoryDialog() {
-        ScrollView sv = new ScrollView(this);
-        sv.setBackgroundColor(theme.bgRoot);
-        LinearLayout list = new LinearLayout(this);
+        final Dialog sheet = new Dialog(this);
+        sheet.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        sheet.setCanceledOnTouchOutside(true);
+
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        final int sheetWidthPx = Math.min(dp(520), Math.round(dm.widthPixels * 0.92f));
+        final int sheetHeightPx = Math.round(dm.heightPixels * 0.82f);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(UiTheme.roundedRect(
+                theme.bgRoot, theme.borderSubtle, dp(22), UiTheme.hairlinePx(this)));
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            card.setClipToOutline(true);
+            card.setElevation(dp(8));
+        }
+
+        // Sheet Header Bar (bgSurface + hairline bottom divider)
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        GradientDrawable headerBg = new GradientDrawable();
+        headerBg.setColor(theme.bgSurface);
+        float topR = dp(22);
+        headerBg.setCornerRadii(new float[]{topR, topR, topR, topR, 0f, 0f, 0f, 0f});
+        header.setBackground(headerBg);
+        header.setPadding(dp(20), dp(14), dp(12), dp(14));
+
+        LinearLayout headerTitles = new LinearLayout(this);
+        headerTitles.setOrientation(LinearLayout.VERTICAL);
+
+        TextView tvTitle = new TextView(this);
+        tvTitle.setText(tr("history_title"));
+        tvTitle.setTextColor(theme.textPrimary);
+        tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        tvTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        headerTitles.addView(tvTitle);
+
+        final String coreName = getActiveCoreDisplayName();
+        final TextView tvSub = new TextView(this);
+        tvSub.setText(String.format(Locale.US, tr("history_refreshing"), coreName));
+        tvSub.setTextColor(theme.textMuted);
+        tvSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tvSub.setFontFeatureSettings("tnum");
+        tvSub.setMaxLines(1);
+        tvSub.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        subLp.topMargin = dp(2);
+        headerTitles.addView(tvSub, subLp);
+
+        header.addView(headerTitles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        final Runnable[] refreshHolder = new Runnable[1];
+        final String[] currentSessionIdHolder = new String[]{""};
+        final Dialog[] nestedConfirm = new Dialog[1];
+        sheet.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override
+            public void onDismiss(DialogInterface dialog) {
+                if (nestedConfirm[0] != null) {
+                    try {
+                        if (nestedConfirm[0].isShowing()) {
+                            nestedConfirm[0].dismiss();
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    nestedConfirm[0] = null;
+                }
+            }
+        });
+        final List<CoreApiClient.ChatEntry> initial = latestCleanTranscript != null
+                ? new ArrayList<CoreApiClient.ChatEntry>(latestCleanTranscript)
+                : new ArrayList<CoreApiClient.ChatEntry>();
+        final boolean[] clearInFlight = new boolean[]{false};
+        final Runnable[] clearVisUpdater = new Runnable[1];
+        final View btnClear = UiTheme.iconTextPill(
+                this, theme, Icons.Name.TRASH, tr("history_clear_btn"),
+                theme.destructiveSoft, theme.accentWarm, 0,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (gatewayService == null || clearInFlight[0]) {
+                            return;
+                        }
+                        final String sid = currentSessionIdHolder[0];
+                        if (nestedConfirm[0] != null) {
+                            try {
+                                if (nestedConfirm[0].isShowing()) {
+                                    nestedConfirm[0].dismiss();
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            nestedConfirm[0] = null;
+                        }
+                        AlertDialog confirmDlg = UiTheme.dialog(MainActivity.this, theme)
+                                .setTitle(tr("history_clear_title"))
+                                .setMessage(tr("history_clear_confirm"))
+                                .setPositiveButton(tr("history_clear_btn"), new DialogInterface.OnClickListener() {
+                                    @Override
+                                    public void onClick(DialogInterface d, int which) {
+                                        if (gatewayService == null || clearInFlight[0]) return;
+                                        clearInFlight[0] = true;
+                                        v.setEnabled(false);
+                                        v.setAlpha(0.45f);
+                                        gatewayService.clearActiveConversationAsync(sid, true, new GatewayService.ActionResultCallback() {
+                                            @Override
+                                            public void onActionDone(final boolean ok, final boolean authRequired) {
+                                                runOnUiThread(new Runnable() {
+                                                    @Override
+                                                    public void run() {
+                                                        clearInFlight[0] = false;
+                                                        v.setEnabled(true);
+                                                        v.setAlpha(1.0f);
+                                                        if (isFinishing() || isDestroyed()) return;
+                                                        boolean authNeeded = !ok && authRequired;
+                                                        Toast.makeText(MainActivity.this,
+                                                                ok ? tr("history_cleared")
+                                                                        : (authNeeded ? tr("auth_action_required_toast") : tr("history_clear_failed")),
+                                                                Toast.LENGTH_SHORT).show();
+                                                        if (authNeeded) {
+                                                            scheduleUiRefresh();
+                                                        }
+                                                        if (ok) {
+                                                            currentSessionIdHolder[0] = "";
+                                                            initial.clear();
+                                                            latestCleanTranscript = new ArrayList<CoreApiClient.ChatEntry>();
+                                                            renderSlimTickerIfChanged(latestCleanTranscript);
+                                                            if (clearVisUpdater[0] != null) {
+                                                                clearVisUpdater[0].run();
+                                                            }
+                                                            if (sheet.isShowing() && refreshHolder[0] != null) {
+                                                                refreshHolder[0].run();
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
+                                })
+                                .setNegativeButton(android.R.string.cancel, null)
+                                .create();
+                        confirmDlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                            @Override
+                            public void onDismiss(DialogInterface dialog) {
+                                if (nestedConfirm[0] == dialog) {
+                                    nestedConfirm[0] = null;
+                                }
+                            }
+                        });
+                        nestedConfirm[0] = confirmDlg;
+                        confirmDlg.show();
+                    }
+                });
+        btnClear.setVisibility(View.GONE);
+        header.addView(btnClear);
+        final View clearSpacer = new View(this);
+        clearSpacer.setVisibility(View.GONE);
+        header.addView(clearSpacer, new LinearLayout.LayoutParams(dp(6), 1));
+
+        final ImageView btnRefresh = UiTheme.circleIconButton(
+                this, theme, Icons.Name.REFRESH, theme.accent, theme.bgElevated, 0, 44,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (refreshHolder[0] != null) {
+                            refreshHolder[0].run();
+                        }
+                    }
+                });
+        header.addView(btnRefresh);
+        header.addView(new View(this), new LinearLayout.LayoutParams(dp(6), 1));
+        header.addView(UiTheme.circleIconButton(
+                this, theme, Icons.Name.CLOSE, theme.textSecondary, theme.bgElevated, 0, 44,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        sheet.dismiss();
+                    }
+                }));
+
+        card.addView(header, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(UiTheme.hairlineDivider(this, theme));
+
+        // Scrollable Timeline Body
+        final ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.setFillViewport(true);
+        final LinearLayout list = new LinearLayout(this);
         list.setOrientation(LinearLayout.VERTICAL);
-        list.setPadding(dp(16), dp(14), dp(16), dp(14));
+        list.setPadding(dp(16), dp(14), dp(16), dp(20));
+        sv.addView(list, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(sv, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        if (latestCleanTranscript.isEmpty()) {
-            TextView empty = new TextView(this);
-            empty.setText(tr("history_empty"));
-            empty.setTextColor(theme.textMuted);
-            empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-            empty.setGravity(Gravity.CENTER);
-            empty.setPadding(dp(12), dp(28), dp(12), dp(28));
-            list.addView(empty);
-        } else {
-            for (CoreApiClient.ChatEntry e : latestCleanTranscript) {
-                boolean isUser = "user".equalsIgnoreCase(e.role);
-                LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.VERTICAL);
-                row.setGravity(isUser ? Gravity.END : Gravity.START);
-                LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                rlp.bottomMargin = dp(12);
+        final int userMaxW = Math.max(dp(180), Math.round(sheetWidthPx * 0.78f));
+        final int asstMaxW = Math.max(dp(200), Math.round(sheetWidthPx * 0.82f));
 
-                TextView roleTv = new TextView(this);
-                roleTv.setText(isUser ? tr("role_user") : tr("role_assistant"));
-                roleTv.setTextColor(theme.textMuted);
-                roleTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-                roleTv.setPadding(dp(4), 0, dp(4), dp(3));
-                row.addView(roleTv);
+        final class HistoryRenderer {
+            void render(List<CoreApiClient.ChatEntry> entries, boolean loading, boolean authRequired) {
+                list.removeAllViews();
+                if (loading) {
+                    tvSub.setText(String.format(Locale.US, tr("history_refreshing"), coreName));
+                } else {
+                    tvSub.setText(String.format(Locale.US, tr("history_subtitle_fmt"), coreName, entries.size()));
+                }
 
-                TextView bubble = new TextView(this);
-                bubble.setText(e.text);
-                bubble.setTextColor(isUser ? theme.primaryFg : theme.textPrimary);
-                bubble.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-                bubble.setLineSpacing(dp(2), 1.0f);
-                bubble.setBackground(UiTheme.roundedRect(
-                        isUser ? theme.primaryBg : theme.bgSurface,
-                        isUser ? 0 : theme.borderSubtle,
-                        dp(16), isUser ? 0 : UiTheme.hairlinePx(this)));
-                bubble.setPadding(dp(14), dp(9), dp(14), dp(9));
-                row.addView(bubble, new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-                list.addView(row, rlp);
+                if (entries.isEmpty()) {
+                    LinearLayout emptyBox = new LinearLayout(MainActivity.this);
+                    emptyBox.setOrientation(LinearLayout.VERTICAL);
+                    emptyBox.setGravity(Gravity.CENTER);
+                    emptyBox.setPadding(dp(24), dp(48), dp(24), dp(48));
+
+                    FrameLayout badge = new FrameLayout(MainActivity.this);
+                    badge.setBackground(UiTheme.pill(authRequired ? theme.destructiveSoft : theme.accentSoft, 0, 0));
+                    ImageView iconView = new ImageView(MainActivity.this);
+                    int isz = dp(24);
+                    iconView.setImageDrawable(Icons.of(
+                            authRequired ? Icons.Name.KEY : Icons.Name.HISTORY,
+                            authRequired ? theme.accentWarm : theme.accent,
+                            isz));
+                    FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(isz, isz, Gravity.CENTER);
+                    badge.addView(iconView, ilp);
+                    emptyBox.addView(badge, new LinearLayout.LayoutParams(dp(56), dp(56)));
+
+                    TextView emptyTitle = new TextView(MainActivity.this);
+                    emptyTitle.setText(loading
+                            ? tr("status_connecting")
+                            : (authRequired ? tr("status_auth_required") : tr("history_empty")));
+                    emptyTitle.setTextColor(theme.textPrimary);
+                    emptyTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+                    emptyTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                    emptyTitle.setGravity(Gravity.CENTER);
+                    LinearLayout.LayoutParams etLp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    etLp.topMargin = dp(16);
+                    emptyBox.addView(emptyTitle, etLp);
+
+                    TextView emptySub = new TextView(MainActivity.this);
+                    emptySub.setText(authRequired ? tr("history_auth_required") : tr("history_empty_sub"));
+                    emptySub.setTextColor(theme.textSecondary);
+                    emptySub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                    emptySub.setGravity(Gravity.CENTER);
+                    emptySub.setMaxWidth(dp(260));
+                    emptySub.setLineSpacing(dp(2), 1.0f);
+                    LinearLayout.LayoutParams esLp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    esLp.topMargin = dp(6);
+                    esLp.bottomMargin = dp(18);
+                    emptyBox.addView(emptySub, esLp);
+
+                    if (!loading) {
+                        if (authRequired) {
+                            emptyBox.addView(UiTheme.iconTextPill(
+                                    MainActivity.this, theme, Icons.Name.KEY, tr("auth_banner_btn"),
+                                    theme.primaryBg, theme.primaryFg, 0,
+                                    new View.OnClickListener() {
+                                        @Override
+                                        public void onClick(View v) {
+                                            sheet.dismiss();
+                                            showActiveCoreTokenDialog();
+                                        }
+                                    }));
+                        } else {
+                            emptyBox.addView(UiTheme.iconTextPill(
+                                    MainActivity.this, theme, Icons.Name.REFRESH, tr("history_refresh"),
+                                    theme.bgSurface, theme.accent, theme.borderSubtle,
+                                    new View.OnClickListener() {
+                                        @Override
+                                        public void onClick(View v) {
+                                            if (refreshHolder[0] != null) {
+                                                refreshHolder[0].run();
+                                            }
+                                        }
+                                    }));
+                        }
+                    }
+
+                    list.addView(emptyBox, new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                    return;
+                }
+
+                boolean hasMultipleSessions = false;
+                String firstSid = entries.get(0).sessionId;
+                boolean firstArch = entries.get(0).archived;
+                for (int i = 1; i < entries.size(); i++) {
+                    CoreApiClient.ChatEntry item = entries.get(i);
+                    if (item.archived != firstArch || !item.sessionId.equals(firstSid)) {
+                        hasMultipleSessions = true;
+                        break;
+                    }
+                }
+
+                String prevSid = null;
+                Boolean prevArchived = null;
+                String prevRole = null;
+                for (int i = 0; i < entries.size(); i++) {
+                    CoreApiClient.ChatEntry e = entries.get(i);
+                    boolean sessionChanged = (prevArchived == null)
+                            ? (hasMultipleSessions || e.archived)
+                            : (prevArchived.booleanValue() != e.archived
+                                || (!e.sessionId.isEmpty() && !e.sessionId.equals(prevSid)));
+
+                    if (sessionChanged) {
+                        String chipText = e.archived ? tr("history_earlier_session") : tr("history_current_session");
+                        String tsLabel = formatChatTimestamp(e.tsMs, true);
+                        if (!tsLabel.isEmpty()) {
+                            chipText = chipText + " · " + tsLabel;
+                        }
+                        LinearLayout divRow = new LinearLayout(MainActivity.this);
+                        divRow.setOrientation(LinearLayout.HORIZONTAL);
+                        divRow.setGravity(Gravity.CENTER_VERTICAL);
+                        LinearLayout.LayoutParams dLp = new LinearLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                        dLp.topMargin = (i == 0) ? dp(2) : dp(16);
+                        dLp.bottomMargin = dp(12);
+
+                        View leftLine = UiTheme.hairlineDivider(MainActivity.this, theme);
+                        divRow.addView(leftLine, new LinearLayout.LayoutParams(0, UiTheme.hairlinePx(MainActivity.this), 1f));
+
+                        TextView chip = new TextView(MainActivity.this);
+                        chip.setText(chipText);
+                        chip.setTextColor(theme.textMuted);
+                        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+                        chip.setFontFeatureSettings("tnum");
+                        chip.setBackground(UiTheme.pill(theme.bgElevated, 0, 0));
+                        chip.setPadding(dp(10), dp(3), dp(10), dp(3));
+                        LinearLayout.LayoutParams cLp = new LinearLayout.LayoutParams(
+                                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                        cLp.leftMargin = dp(10);
+                        cLp.rightMargin = dp(10);
+                        divRow.addView(chip, cLp);
+
+                        View rightLine = UiTheme.hairlineDivider(MainActivity.this, theme);
+                        divRow.addView(rightLine, new LinearLayout.LayoutParams(0, UiTheme.hairlinePx(MainActivity.this), 1f));
+                        list.addView(divRow, dLp);
+                        prevRole = null;
+                    }
+
+                    boolean isUser = "user".equalsIgnoreCase(e.role);
+                    boolean sameSpeakerAsPrev = (prevRole != null && prevRole.equalsIgnoreCase(e.role));
+
+                    LinearLayout row = new LinearLayout(MainActivity.this);
+                    row.setOrientation(LinearLayout.VERTICAL);
+                    row.setGravity(isUser ? Gravity.END : Gravity.START);
+                    LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    rlp.topMargin = sameSpeakerAsPrev ? dp(4) : dp(10);
+
+                    TextView bubble = new TextView(MainActivity.this);
+                    bubble.setText(e.text);
+                    bubble.setTextColor(isUser ? theme.primaryFg : theme.textPrimary);
+                    bubble.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    bubble.setLineSpacing(dp(3), 1.0f);
+                    bubble.setMaxWidth(isUser ? userMaxW : asstMaxW);
+                    bubble.setTextIsSelectable(true);
+                    bubble.setBackground(UiTheme.roundedRect(
+                            isUser ? theme.primaryBg : theme.bgSurface,
+                            isUser ? 0 : theme.borderSubtle,
+                            dp(18), isUser ? 0 : UiTheme.hairlinePx(MainActivity.this)));
+                    bubble.setPadding(dp(14), dp(10), dp(14), dp(10));
+                    row.addView(bubble, new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                    String timeStr = formatChatTimestamp(e.tsMs, false);
+                    if (!timeStr.isEmpty()) {
+                        TextView tvTs = new TextView(MainActivity.this);
+                        tvTs.setText(timeStr);
+                        tvTs.setTextColor(theme.textMuted);
+                        tvTs.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+                        tvTs.setFontFeatureSettings("tnum");
+                        tvTs.setPadding(dp(6), dp(3), dp(6), 0);
+                        row.addView(tvTs);
+                    }
+
+                    list.addView(row, rlp);
+                    prevSid = e.sessionId;
+                    prevArchived = Boolean.valueOf(e.archived);
+                    prevRole = e.role;
+                }
+
+                sv.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        sv.fullScroll(View.FOCUS_DOWN);
+                    }
+                });
             }
         }
-        sv.addView(list);
-        showTrackedDialog(UiTheme.dialog(this, theme)
-                .setTitle(tr("history_title"))
-                .setView(sv)
-                .setPositiveButton(android.R.string.ok, null)
-                .create());
+
+        final HistoryRenderer renderer = new HistoryRenderer();
+        clearVisUpdater[0] = new Runnable() {
+            @Override
+            public void run() {
+                boolean hasAny = latestCleanTranscript != null && !latestCleanTranscript.isEmpty();
+                int clearVis = hasAny ? View.VISIBLE : View.GONE;
+                btnClear.setVisibility(clearVis);
+                clearSpacer.setVisibility(clearVis);
+                if (!hasAny && sheet.isShowing()) {
+                    renderer.render(new ArrayList<CoreApiClient.ChatEntry>(), false, false);
+                }
+            }
+        };
+        if (!initial.isEmpty() && !(gatewayService != null && gatewayService.isAuthRequired())) {
+            btnClear.setVisibility(View.VISIBLE);
+            clearSpacer.setVisibility(View.VISIBLE);
+        }
+        renderer.render(initial, initial.isEmpty() && gatewayService != null, false);
+
+        refreshHolder[0] = new Runnable() {
+            @Override
+            public void run() {
+                if (gatewayService == null) {
+                    renderer.render(initial, false, false);
+                    return;
+                }
+                btnRefresh.setEnabled(false);
+                btnRefresh.setAlpha(0.45f);
+                tvSub.setText(String.format(Locale.US, tr("history_refreshing"), coreName));
+                gatewayService.fetchConversationHistoryNowAsync(new GatewayService.HistoryCallback() {
+                    @Override
+                    public void onHistoryLoaded(
+                            final List<CoreApiClient.ChatEntry> messages,
+                            final String currentSessionId,
+                            final boolean authRequired,
+                            final boolean ok) {
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (isFinishing() || isDestroyed() || !sheet.isShowing()) {
+                                    return;
+                                }
+                                btnRefresh.setEnabled(true);
+                                btnRefresh.setAlpha(1.0f);
+                                List<CoreApiClient.ChatEntry> toShow = (messages != null && !messages.isEmpty())
+                                        ? messages
+                                        : (ok ? new ArrayList<CoreApiClient.ChatEntry>() : initial);
+                                if (ok && messages != null) {
+                                    latestCleanTranscript = messages;
+                                    renderSlimTickerIfChanged(messages);
+                                }
+                                currentSessionIdHolder[0] = (currentSessionId != null) ? currentSessionId.trim() : "";
+                                boolean hasAnyEntries = toShow != null && !toShow.isEmpty();
+                                int clearVis = (hasAnyEntries && !authRequired) ? View.VISIBLE : View.GONE;
+                                btnClear.setVisibility(clearVis);
+                                clearSpacer.setVisibility(clearVis);
+                                renderer.render(toShow, false, authRequired);
+                            }
+                        });
+                    }
+                });
+            }
+        };
+
+        sheet.setContentView(card, new ViewGroup.LayoutParams(sheetWidthPx, sheetHeightPx));
+        showTrackedDialog(sheet);
+        Window win = sheet.getWindow();
+        if (win != null) {
+            win.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            WindowManager.LayoutParams wlp = win.getAttributes();
+            wlp.width = sheetWidthPx;
+            wlp.height = sheetHeightPx;
+            wlp.gravity = Gravity.CENTER;
+            wlp.dimAmount = theme.isLight ? 0.42f : 0.68f;
+            win.setAttributes(wlp);
+            win.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+        }
+
+        // Trigger immediate live + archived fetch from Core
+        refreshHolder[0].run();
     }
 
     private void sendComposerText() {
@@ -1222,6 +1746,10 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         }
         String text = etComposer.getText().toString().trim();
         if (!text.isEmpty()) {
+            if (!gatewayService.isManageOnlyMode() && !gatewayService.isConnected()) {
+                Toast.makeText(this, tr("voice_disconnected_reconnect"), Toast.LENGTH_SHORT).show();
+                return;
+            }
             etComposer.setText("");
             gatewayService.triggerUtterance(text);
         }
@@ -1237,60 +1765,71 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         body.setOrientation(LinearLayout.VERTICAL);
         body.setPadding(dp(16), dp(2), dp(16), dp(28));
 
-        // 1. Whole-Home Cores Section Header + Scan/Refresh Pills
+        // 1. Whole-Home Devices Section Header + Compact Scan/Refresh (hidden when list is empty)
         LinearLayout whHeader = new LinearLayout(this);
         whHeader.setOrientation(LinearLayout.HORIZONTAL);
         whHeader.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams whLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         whLp.topMargin = dp(10);
-        whLp.bottomMargin = dp(8);
+        whLp.bottomMargin = dp(10);
 
-        TextView tvWhTitle = new TextView(this);
-        tvWhTitle.setText(tr("rooms_whole_home_title"));
-        tvWhTitle.setTextColor(theme.textSecondary);
-        tvWhTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        tvWhTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        tvRoomsSectionTitle = new TextView(this);
+        tvRoomsSectionTitle.setText(tr("rooms_whole_home_title"));
+        tvRoomsSectionTitle.setTextColor(theme.textSecondary);
+        tvRoomsSectionTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tvRoomsSectionTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         LinearLayout.LayoutParams wtLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         wtLp.leftMargin = dp(6);
-        whHeader.addView(tvWhTitle, wtLp);
+        whHeader.addView(tvRoomsSectionTitle, wtLp);
 
-        whHeader.addView(UiTheme.iconTextPill(this, theme, Icons.Name.WIFI, tr("rooms_scan_btn"),
+        roomsHeaderActions = new LinearLayout(this);
+        roomsHeaderActions.setOrientation(LinearLayout.HORIZONTAL);
+        roomsHeaderActions.setGravity(Gravity.CENTER_VERTICAL);
+        roomsHeaderActions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.WIFI, tr("rooms_scan_short"),
                 theme.accentSoft, theme.accent, 0,
                 new View.OnClickListener() {
                     @Override public void onClick(View v) { scanLanAndRefreshRooms(); }
                 }));
-        whHeader.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
-        whHeader.addView(UiTheme.circleIconButton(this, theme, Icons.Name.REFRESH, theme.accent,
+        roomsHeaderActions.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
+        roomsHeaderActions.addView(UiTheme.circleIconButton(this, theme, Icons.Name.REFRESH, theme.accent,
                 theme.bgSurface, theme.borderSubtle, 44,
                 new View.OnClickListener() {
                     @Override public void onClick(View v) { refreshWholeHomeRoomCards(); }
                 }));
+        whHeader.addView(roomsHeaderActions);
         body.addView(whHeader, whLp);
 
         wholeHomeRoomsContainer = new LinearLayout(this);
         wholeHomeRoomsContainer.setOrientation(LinearLayout.VERTICAL);
         body.addView(wholeHomeRoomsContainer);
 
-        // 2. Local Volume & Acoustics Card
-        body.addView(UiTheme.sectionHeading(this, theme, tr("mode_audio_title")));
-        LinearLayout audioCard = UiTheme.insetGroupCard(this, theme, 16, 14);
+        // 2. Unified Active Room Controls (hidden until a Core is configured)
+        roomsActiveControlsSection = new LinearLayout(this);
+        roomsActiveControlsSection.setOrientation(LinearLayout.VERTICAL);
+        roomsActiveControlsSection.setVisibility(config.hasConfiguredCore() ? View.VISIBLE : View.GONE);
 
+        roomsActiveControlsSection.addView(UiTheme.sectionHeading(this, theme, tr("rooms_active_controls_title")));
+        LinearLayout controlsCard = UiTheme.insetGroupCard(this, theme, 16, 14);
+
+        // Volume slider
         LinearLayout volHeader = new LinearLayout(this);
         volHeader.setOrientation(LinearLayout.HORIZONTAL);
+        volHeader.setGravity(Gravity.CENTER_VERTICAL);
         TextView tvVolLbl = new TextView(this);
         tvVolLbl.setText(tr("volume_label"));
         tvVolLbl.setTextColor(theme.textPrimary);
-        tvVolLbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        tvVolLbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         volHeader.addView(tvVolLbl, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         tvRoomsVolumePct = new TextView(this);
         tvRoomsVolumePct.setText("65%");
         tvRoomsVolumePct.setTextColor(theme.textSecondary);
         tvRoomsVolumePct.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tvRoomsVolumePct.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         tvRoomsVolumePct.setFontFeatureSettings("tnum");
         volHeader.addView(tvRoomsVolumePct);
-        audioCard.addView(volHeader);
+        controlsCard.addView(volHeader);
 
         roomsVolumeSlider = new SeekBar(this);
         roomsVolumeSlider.setMax(100);
@@ -1305,51 +1844,92 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
                 if (gatewayService != null) {
-                    gatewayService.setVolumeFromUi(seekBar.getProgress() / 100.0);
+                    double targetVol = seekBar.getProgress() / 100.0;
+                    boolean manageOnly = gatewayService.isManageOnlyMode();
+                    if (DeviceRoutingPolicy.shouldUseRemoteVolumeControl(manageOnly)) {
+                        String devId = DeviceRoutingPolicy.resolvePrimaryRemoteDeviceId(true, gatewayService.getCoreSnapshot());
+                        if (!devId.isEmpty()) {
+                            gatewayService.setRemoteRoomVolumeAsync(
+                                    config.getCoreHost(), config.getWebPort(), devId, targetVol,
+                                    new GatewayService.ActionResultCallback() {
+                                        @Override
+                                        public void onActionDone(boolean ok, boolean authRequired) {
+                                            if (ok && gatewayService != null) {
+                                                gatewayService.refreshCoreSnapshotNow();
+                                            }
+                                        }
+                                    });
+                        }
+                    } else {
+                        // Voice Gateway (connected or transiently disconnected): control ONLY local audio volume!
+                        gatewayService.setVolumeFromUi(targetVol);
+                    }
                 }
             }
         });
         LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         sLp.topMargin = dp(8);
-        sLp.bottomMargin = dp(10);
-        audioCard.addView(roomsVolumeSlider, sLp);
+        sLp.bottomMargin = dp(12);
+        controlsCard.addView(roomsVolumeSlider, sLp);
 
-        tvRoomsAcousticBar = new TextView(this);
-        tvRoomsAcousticBar.setTextColor(theme.textMuted);
-        tvRoomsAcousticBar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        tvRoomsAcousticBar.setFontFeatureSettings("tnum");
-        audioCard.addView(tvRoomsAcousticBar);
-        body.addView(audioCard);
+        controlsCard.addView(UiTheme.hairlineDivider(this, theme));
 
-        // 3. Live Core Mode Controls
-        body.addView(UiTheme.sectionHeading(this, theme, tr("rooms_mode_title")));
-        LinearLayout modeCard = UiTheme.insetGroupCard(this, theme, 16, 14);
-
+        // Duplex mode segmented control
         TextView tvDupLbl = new TextView(this);
         tvDupLbl.setText(tr("mode_duplex"));
         tvDupLbl.setTextColor(theme.textSecondary);
-        tvDupLbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        modeCard.addView(tvDupLbl);
+        tvDupLbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        LinearLayout.LayoutParams dupLblLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dupLblLp.topMargin = dp(12);
+        controlsCard.addView(tvDupLbl, dupLblLp);
 
         LinearLayout dupRow = buildAppleSegmentedTrack();
         LinearLayout.LayoutParams dRowLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        dRowLp.topMargin = dp(8);
+        dRowLp.topMargin = dp(6);
         dRowLp.bottomMargin = dp(12);
 
         tvModeDuplexHalf = buildSegmentPill(tr("mode_half"), new View.OnClickListener() {
             @Override public void onClick(View v) { applyModeUpdate("half", null, null, null); }
         });
         tvModeDuplexFull = buildSegmentPill(tr("mode_full"), new View.OnClickListener() {
-            @Override public void onClick(View v) { applyModeUpdate("full", null, null, null); }
+            @Override
+            public void onClick(View v) {
+                if (gatewayService != null && gatewayService.getCoreSnapshot() != null
+                        && "full".equalsIgnoreCase(gatewayService.getCoreSnapshot().duplexMode)) {
+                    return;
+                }
+                showTrackedDialog(UiTheme.dialog(MainActivity.this, theme)
+                        .setTitle(tr("mode_full_dev_confirm_title"))
+                        .setMessage(tr("mode_full_dev_confirm_msg"))
+                        .setPositiveButton(tr("mode_full_dev_confirm_ok"), new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                                applyModeUpdate("full", null, null, null);
+                            }
+                        })
+                        .setNegativeButton(android.R.string.cancel, null)
+                        .create());
+            }
         });
         dupRow.addView(tvModeDuplexHalf, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         dupRow.addView(tvModeDuplexFull, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        modeCard.addView(dupRow, dRowLp);
+        dRowLp.bottomMargin = dp(4);
+        controlsCard.addView(dupRow, dRowLp);
 
-        modeCard.addView(UiTheme.hairlineDivider(this, theme));
-        swBargeIn = addSwitchRow(modeCard, tr("mode_barge_in"), false, new CompoundButton.OnCheckedChangeListener() {
+        TextView tvDupHint = new TextView(this);
+        tvDupHint.setText(tr("mode_full_dev_hint"));
+        tvDupHint.setTextColor(theme.textMuted);
+        tvDupHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        LinearLayout.LayoutParams dupHintLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dupHintLp.bottomMargin = dp(10);
+        controlsCard.addView(tvDupHint, dupHintLp);
+
+        controlsCard.addView(UiTheme.hairlineDivider(this, theme));
+        swBargeIn = addSwitchRow(controlsCard, tr("mode_barge_in"), false, new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
                 if (!updatingControlsFromSnapshot) {
@@ -1357,8 +1937,8 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                 }
             }
         });
-        modeCard.addView(UiTheme.hairlineDivider(this, theme));
-        swWakeAck = addSwitchRow(modeCard, tr("mode_wake_ack"), true, new CompoundButton.OnCheckedChangeListener() {
+        controlsCard.addView(UiTheme.hairlineDivider(this, theme));
+        swWakeAck = addSwitchRow(controlsCard, tr("mode_wake_ack"), true, new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
                 if (!updatingControlsFromSnapshot) {
@@ -1366,21 +1946,27 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                 }
             }
         });
-        modeCard.addView(UiTheme.hairlineDivider(this, theme));
+
+        // Multi-room wake arbitration (visible only when >1 room or fleet peers exist)
+        roomsArbSection = new LinearLayout(this);
+        roomsArbSection.setOrientation(LinearLayout.VERTICAL);
+        roomsArbSection.setVisibility(View.GONE);
+        roomsArbSection.addView(UiTheme.hairlineDivider(this, theme));
 
         TextView tvArbLbl = new TextView(this);
         tvArbLbl.setText(tr("mode_wake_arb"));
         tvArbLbl.setTextColor(theme.textSecondary);
-        tvArbLbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tvArbLbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         LinearLayout.LayoutParams aLblLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         aLblLp.topMargin = dp(12);
-        modeCard.addView(tvArbLbl, aLblLp);
+        roomsArbSection.addView(tvArbLbl, aLblLp);
 
         LinearLayout arbRow = buildAppleSegmentedTrack();
         LinearLayout.LayoutParams aRowLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        aRowLp.topMargin = dp(8);
+        aRowLp.topMargin = dp(6);
+        aRowLp.bottomMargin = dp(10);
         tvArbOff = buildSegmentPill(tr("arb_off"), new View.OnClickListener() {
             @Override public void onClick(View v) { applyModeUpdate(null, null, null, "off"); }
         });
@@ -1393,29 +1979,89 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         arbRow.addView(tvArbOff, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         arbRow.addView(tvArbObserve, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         arbRow.addView(tvArbEnforce, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        modeCard.addView(arbRow, aRowLp);
-        body.addView(modeCard);
+        roomsArbSection.addView(arbRow, aRowLp);
+        controlsCard.addView(roomsArbSection);
 
-        // 4. Connected Gateway Devices
-        body.addView(UiTheme.sectionHeading(this, theme, tr("rooms_devices_title")));
-        devicesListContainer = UiTheme.insetGroupCard(this, theme, 16, 12);
-        body.addView(devicesListContainer);
+        // Collapsible Devices & Acoustics disclosure row (keeps Rooms screen scannable and calm)
+        controlsCard.addView(UiTheme.hairlineDivider(this, theme));
+        LinearLayout detailsToggleRow = new LinearLayout(this);
+        detailsToggleRow.setOrientation(LinearLayout.HORIZONTAL);
+        detailsToggleRow.setGravity(Gravity.CENTER_VERTICAL);
+        detailsToggleRow.setMinimumHeight(dp(46));
+        detailsToggleRow.setPadding(0, dp(10), 0, dp(4));
+        detailsToggleRow.setBackground(UiTheme.rippleRoundedRect(theme, Color.TRANSPARENT, 0, dp(8), 0));
+        detailsToggleRow.setClickable(true);
 
-        // 5. Multi-Room Fleet Nodes (shown only when fleet nodes exist)
-        fleetSectionHeading = UiTheme.sectionHeading(this, theme, tr("rooms_fleet_title"));
-        fleetSectionHeading.setVisibility(View.GONE);
-        body.addView(fleetSectionHeading);
-        fleetListContainer = UiTheme.insetGroupCard(this, theme, 16, 12);
-        fleetListContainer.setVisibility(View.GONE);
-        body.addView(fleetListContainer);
+        TextView tvDetailsLbl = new TextView(this);
+        tvDetailsLbl.setText(tr("rooms_details_toggle"));
+        tvDetailsLbl.setTextColor(theme.textSecondary);
+        tvDetailsLbl.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tvDetailsLbl.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        detailsToggleRow.addView(tvDetailsLbl, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        ivRoomsDetailsChevron = new ImageView(this);
+        int chevSz = dp(16);
+        ivRoomsDetailsChevron.setImageDrawable(Icons.of(
+                roomsDetailsExpanded ? Icons.Name.CHEVRON_UP : Icons.Name.CHEVRON_DOWN,
+                theme.textMuted, chevSz));
+        detailsToggleRow.addView(ivRoomsDetailsChevron, new LinearLayout.LayoutParams(chevSz, chevSz));
+
+        roomsDetailsBody = new LinearLayout(this);
+        roomsDetailsBody.setOrientation(LinearLayout.VERTICAL);
+        roomsDetailsBody.setVisibility(roomsDetailsExpanded ? View.VISIBLE : View.GONE);
+
+        tvRoomsAcousticBar = new TextView(this);
+        tvRoomsAcousticBar.setTextColor(theme.textMuted);
+        tvRoomsAcousticBar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tvRoomsAcousticBar.setFontFeatureSettings("tnum");
+        LinearLayout.LayoutParams acBarLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        acBarLp.topMargin = dp(8);
+        acBarLp.bottomMargin = dp(10);
+        roomsDetailsBody.addView(tvRoomsAcousticBar, acBarLp);
+
+        roomsDetailsBody.addView(UiTheme.hairlineDivider(this, theme));
+
+        devicesListContainer = new LinearLayout(this);
+        devicesListContainer.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams dlLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dlLp.topMargin = dp(4);
+        roomsDetailsBody.addView(devicesListContainer, dlLp);
+
+        detailsToggleRow.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                roomsDetailsExpanded = !roomsDetailsExpanded;
+                roomsDetailsBody.setVisibility(roomsDetailsExpanded ? View.VISIBLE : View.GONE);
+                ivRoomsDetailsChevron.setImageDrawable(Icons.of(
+                        roomsDetailsExpanded ? Icons.Name.CHEVRON_UP : Icons.Name.CHEVRON_DOWN,
+                        theme.textMuted, dp(16)));
+            }
+        });
+
+        controlsCard.addView(detailsToggleRow);
+        controlsCard.addView(roomsDetailsBody);
+        roomsActiveControlsSection.addView(controlsCard);
+        body.addView(roomsActiveControlsSection);
 
         sv.addView(body);
         return sv;
     }
 
     private void scanLanAndRefreshRooms() {
-        if (gatewayService == null) return;
-        Toast.makeText(this, tr("rooms_scanning"), Toast.LENGTH_SHORT).show();
+        scanLanAndRefreshRooms(true);
+    }
+
+    private void scanLanAndRefreshRooms(boolean showStartToast) {
+        if (gatewayService == null) {
+            pendingLanScanAction = PENDING_LAN_SCAN_ROOMS;
+            Toast.makeText(this, tr("rooms_scanning"), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (showStartToast) {
+            Toast.makeText(this, tr("rooms_scanning"), Toast.LENGTH_SHORT).show();
+        }
         gatewayService.discoverLanCoresAsync(false, new GatewayService.DiscoveryCallback() {
             @Override
             public void onCoresDiscovered(final List<CoreDiscovery.DiscoveredCore> cores) {
@@ -1432,6 +2078,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                         }
                         refreshProfilesList();
                         refreshWholeHomeRoomCards();
+                        scheduleUiRefresh();
                     }
                 });
             }
@@ -1466,35 +2113,70 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             for (GatewayConfig.ServerProfile p : config.getServerProfiles()) {
                 displayList.add(new CoreApiClient.RoomNodeSummary(
                         p.host, p.webPort, p.gatewayPort, p.name, "Home Mate",
-                        false, false, false, false, "", "", "half", "", 0, "loading", p.coreId, false));
+                        false, false, !p.manageOnly, false, "", "", "half", "", 0, "loading", p.coreId, false));
             }
         }
+
+        boolean configured = config.hasConfiguredCore();
+        if (roomsActiveControlsSection != null) {
+            roomsActiveControlsSection.setVisibility(configured ? View.VISIBLE : View.GONE);
+        }
+
         if (displayList.isEmpty()) {
-            LinearLayout emptyCard = UiTheme.insetGroupCard(this, theme, 16, 16);
+            if (roomsHeaderActions != null) {
+                roomsHeaderActions.setVisibility(View.GONE);
+            }
+            if (tvRoomsSectionTitle != null) {
+                tvRoomsSectionTitle.setText(tr("rooms_whole_home_title"));
+            }
+            if (roomsArbSection != null) {
+                roomsArbSection.setVisibility(View.GONE);
+            }
+
+            LinearLayout emptyCard = UiTheme.insetGroupCard(this, theme, 20, 24);
+            emptyCard.setGravity(Gravity.CENTER_HORIZONTAL);
+
+            FrameLayout badge = new FrameLayout(this);
+            badge.setBackground(UiTheme.pill(theme.accentSoft, 0, 0));
+            ImageView ivBadge = new ImageView(this);
+            int bsz = dp(22);
+            ivBadge.setImageDrawable(Icons.of(Icons.Name.ROOMS, theme.accent, bsz));
+            badge.addView(ivBadge, new FrameLayout.LayoutParams(bsz, bsz, Gravity.CENTER));
+            emptyCard.addView(badge, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
             TextView tvTitle = new TextView(this);
             tvTitle.setText(tr("onboarding_title"));
             tvTitle.setTextColor(theme.textPrimary);
-            tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+            tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
             tvTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-            emptyCard.addView(tvTitle);
+            tvTitle.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            tlp.topMargin = dp(14);
+            emptyCard.addView(tvTitle, tlp);
+
             TextView tvDesc = new TextView(this);
             tvDesc.setText(tr("onboarding_desc"));
-            tvDesc.setTextColor(theme.textMuted);
-            tvDesc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            tvDesc.setTextColor(theme.textSecondary);
+            tvDesc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            tvDesc.setGravity(Gravity.CENTER);
+            tvDesc.setLineSpacing(dp(2), 1.0f);
             LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            dlp.topMargin = dp(4);
-            dlp.bottomMargin = dp(12);
+            dlp.topMargin = dp(6);
+            dlp.bottomMargin = dp(18);
             emptyCard.addView(tvDesc, dlp);
+
             LinearLayout btns = new LinearLayout(this);
             btns.setOrientation(LinearLayout.HORIZONTAL);
-            btns.addView(UiTheme.iconTextPill(this, theme, Icons.Name.WIFI, tr("rooms_scan_btn"),
+            btns.setGravity(Gravity.CENTER);
+            btns.addView(UiTheme.iconTextPill(this, theme, Icons.Name.WIFI, tr("rooms_scan_primary"),
                     theme.primaryBg, theme.primaryFg, 0,
                     new View.OnClickListener() {
                         @Override public void onClick(View v) { scanLanAndRefreshRooms(); }
                     }));
-            btns.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
-            btns.addView(UiTheme.iconTextPill(this, theme, Icons.Name.SETTINGS, tr("settings_add_profile"),
+            btns.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
+            btns.addView(UiTheme.iconTextPill(this, theme, null, tr("rooms_add_manual"),
                     theme.bgElevated, theme.textPrimary, 0,
                     new View.OnClickListener() {
                         @Override public void onClick(View v) { showCustomProfileDialog(null); }
@@ -1504,15 +2186,32 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             return;
         }
 
+        if (roomsHeaderActions != null) {
+            roomsHeaderActions.setVisibility(View.VISIBLE);
+        }
+        if (tvRoomsSectionTitle != null) {
+            tvRoomsSectionTitle.setText(String.format(Locale.US, tr("rooms_count_fmt"), displayList.size()));
+        }
+        if (roomsArbSection != null) {
+            CoreApiClient.CoreSnapshot snapNow = gatewayService != null ? gatewayService.getCoreSnapshot() : null;
+            boolean showArb = displayList.size() > 1
+                    || (snapNow != null && snapNow.fleetNodes != null && !snapNow.fleetNodes.isEmpty());
+            roomsArbSection.setVisibility(showArb ? View.VISIBLE : View.GONE);
+        }
+
         String activeHost = config.getCoreHost();
         for (final CoreApiClient.RoomNodeSummary r : displayList) {
             boolean isActive = r.host.equalsIgnoreCase(activeHost);
+            Integer volPct = (r.volume != null && !Double.isNaN(r.volume) && !Double.isInfinite(r.volume))
+                    ? Integer.valueOf(Math.max(0, Math.min(100, (int) Math.round(r.volume.doubleValue() * 100.0))))
+                    : null;
+
             LinearLayout card = UiTheme.insetGroupCard(this, theme, 16, 14);
             LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             clp.bottomMargin = dp(10);
 
-            // Row 1: Dot + Room Name + Capability Badge
+            // Row 1: Status dot + Room Name + Single-line subtitle + Restrained badges
             LinearLayout top = new LinearLayout(this);
             top.setOrientation(LinearLayout.HORIZONTAL);
             top.setGravity(Gravity.CENTER_VERTICAL);
@@ -1540,47 +2239,118 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             TextView tvMeta = new TextView(this);
             String statusText;
             if (r.authRequired) {
-                statusText = r.host + " · " + tr("status_auth_required");
+                statusText = r.host + " · " + tr("rooms_need_token");
             } else if (!r.online) {
                 statusText = r.host + " · " + ("loading".equals(r.error) ? tr("status_connecting") : tr("rooms_room_offline"));
-            } else if (r.musicActive && !r.musicTitle.isEmpty()) {
-                statusText = r.host + " · " + tr("now_playing") + ": " + r.musicTitle;
             } else {
-                statusText = r.host + " · " + tr("rooms_room_idle");
+                String baseStatus = isActive ? tr("rooms_active_online") : tr("rooms_room_idle");
+                statusText = (volPct != null)
+                        ? (baseStatus + " · " + tr("rooms_vol_short") + " " + volPct + "%")
+                        : baseStatus;
             }
             tvMeta.setText(statusText);
-            tvMeta.setTextColor(r.musicActive ? theme.accent : theme.textMuted);
+            tvMeta.setTextColor(r.authRequired ? theme.accentWarm : theme.textMuted);
             tvMeta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            tvMeta.setFontFeatureSettings("tnum");
             tvMeta.setMaxLines(1);
             tvMeta.setEllipsize(TextUtils.TruncateAt.END);
-            titleCol.addView(tvMeta);
+            LinearLayout.LayoutParams mLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            mLp.topMargin = dp(2);
+            titleCol.addView(tvMeta, mLp);
             top.addView(titleCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+            boolean showManageBadge = r.online && !r.authRequired && !r.voiceGatewayOpen;
             if (isActive) {
                 TextView activeBadge = UiTheme.pillBadge(this, theme, tr("badge_active"),
                         theme.accentSoft, theme.accent);
                 LinearLayout.LayoutParams abLp = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                abLp.rightMargin = r.online ? dp(6) : 0;
+                abLp.rightMargin = showManageBadge ? dp(6) : 0;
                 top.addView(activeBadge, abLp);
             }
-            if (r.online) {
-                if (r.lanGatewayExempt && !r.authRequired) {
-                    TextView exemptBadge = UiTheme.pillBadge(this, theme, tr("badge_lan_exempt"),
-                            theme.accentSoft, theme.accent);
-                    LinearLayout.LayoutParams ebLp = new LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                    ebLp.rightMargin = dp(6);
-                    top.addView(exemptBadge, ebLp);
-                }
-                TextView capBadge = UiTheme.pillBadge(this, theme,
-                        r.voiceGatewayOpen ? tr("badge_voice_manage") : tr("badge_manage_only"),
+            if (showManageBadge) {
+                TextView capBadge = UiTheme.pillBadge(this, theme, tr("badge_manage_only"),
                         theme.bgElevated, theme.textSecondary);
                 top.addView(capBadge);
             }
             card.addView(top);
 
-            // Row 2: Direct Per-Room Apple Controls (horizontally scrollable so 360dp / 86-panels never clip)
+            // Compact inline Now-Playing bar ONLY when media is actively playing or paused on this room
+            if (r.online && !r.authRequired && (r.musicActive || r.musicPaused)) {
+                LinearLayout npBar = new LinearLayout(this);
+                npBar.setOrientation(LinearLayout.HORIZONTAL);
+                npBar.setGravity(Gravity.CENTER_VERTICAL);
+                npBar.setBackground(UiTheme.roundedRect(theme.bgInput, 0, dp(12), 0));
+                npBar.setPadding(dp(12), dp(6), dp(8), dp(6));
+                LinearLayout.LayoutParams npLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                npLp.topMargin = dp(10);
+
+                ImageView ivMusic = new ImageView(this);
+                int msz = dp(16);
+                ivMusic.setImageDrawable(Icons.of(Icons.Name.MUSIC, theme.accent, msz));
+                LinearLayout.LayoutParams miLp = new LinearLayout.LayoutParams(msz, msz);
+                miLp.rightMargin = dp(8);
+                npBar.addView(ivMusic, miLp);
+
+                String trackTitle = !r.musicTitle.isEmpty()
+                        ? r.musicTitle
+                        : (r.musicActive ? tr("now_playing") : tr("music_paused"));
+                if (r.musicPaused && !r.musicTitle.isEmpty()) {
+                    trackTitle = trackTitle + " · " + tr("music_paused");
+                }
+                TextView tvTrack = new TextView(this);
+                tvTrack.setText(trackTitle);
+                tvTrack.setTextColor(theme.textPrimary);
+                tvTrack.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                tvTrack.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+                tvTrack.setMaxLines(1);
+                tvTrack.setEllipsize(TextUtils.TruncateAt.END);
+                npBar.addView(tvTrack, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                if (!r.activeDeviceId.isEmpty()) {
+                    npBar.addView(UiTheme.circleIconButton(this, theme,
+                            r.musicActive ? Icons.Name.PAUSE : Icons.Name.PLAY, theme.accent,
+                            theme.accentSoft, 0, 44,
+                            new View.OnClickListener() {
+                                @Override
+                                public void onClick(View v) {
+                                    if (gatewayService != null) {
+                                        gatewayService.controlRemoteRoomMediaAsync(
+                                                r.host, r.webPort, r.activeDeviceId,
+                                                r.musicActive ? "pause" : "resume", makeActionToast());
+                                    }
+                                }
+                            }));
+                    npBar.addView(new View(this), new LinearLayout.LayoutParams(dp(4), 1));
+                    npBar.addView(UiTheme.circleIconButton(this, theme, Icons.Name.SKIP_NEXT, theme.textPrimary,
+                            Color.TRANSPARENT, 0, 44,
+                            new View.OnClickListener() {
+                                @Override
+                                public void onClick(View v) {
+                                    if (gatewayService != null) {
+                                        gatewayService.controlRemoteRoomMediaAsync(
+                                                r.host, r.webPort, r.activeDeviceId, "next", makeActionToast());
+                                    }
+                                }
+                            }));
+                    npBar.addView(new View(this), new LinearLayout.LayoutParams(dp(4), 1));
+                    npBar.addView(UiTheme.circleIconButton(this, theme, Icons.Name.STOP, theme.destructive,
+                            theme.destructiveSoft, 0, 44,
+                            new View.OnClickListener() {
+                                @Override
+                                public void onClick(View v) {
+                                    if (gatewayService != null) {
+                                        gatewayService.stopRemoteRoomAsync(r.host, r.webPort, r.activeDeviceId, makeActionToast());
+                                    }
+                                }
+                            }));
+                }
+                card.addView(npBar, npLp);
+            }
+
+            // Row 2: Clean, restrained contextual actions (no media player clutter on idle rooms)
             HorizontalScrollView actionsScroll = new HorizontalScrollView(this);
             actionsScroll.setHorizontalScrollBarEnabled(false);
             LinearLayout actions = new LinearLayout(this);
@@ -1591,69 +2361,50 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             aLp.topMargin = dp(12);
 
             if (r.authRequired) {
-                actions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.KEY, tr("rooms_token_btn"),
+                actions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.KEY, tr("rooms_enter_token_btn"),
                         theme.primaryBg, theme.primaryFg, 0,
                         new View.OnClickListener() {
                             @Override public void onClick(View v) { showRoomTokenDialog(r); }
                         }));
-                actions.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
             } else if (r.online) {
-                actions.addView(UiTheme.circleIconButton(this, theme, Icons.Name.PAUSE, theme.textPrimary,
-                        theme.bgElevated, 0, 44,
-                        new View.OnClickListener() {
-                            @Override
-                            public void onClick(View v) {
-                                if (gatewayService != null) {
-                                    gatewayService.pauseRemoteRoomAsync(r.host, r.webPort, r.activeDeviceId, makeActionToast());
+                if (!isActive) {
+                    actions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.CHECK, tr("rooms_switch_here_btn"),
+                            theme.accentSoft, theme.accent, 0,
+                            new View.OnClickListener() {
+                                @Override
+                                public void onClick(View v) {
+                                    switchActiveCore(r.displayName, r.host, r.gatewayPort, r.webPort, r.coreId, null,
+                                            DeviceRoutingPolicy.resolveManageOnlyForRoomSwitch(
+                                                    r.online, r.authRequired, r.voiceGatewayOpen));
                                 }
-                            }
-                        }));
-                actions.addView(new View(this), new LinearLayout.LayoutParams(dp(6), 1));
-                actions.addView(UiTheme.circleIconButton(this, theme, Icons.Name.SKIP_NEXT, theme.textPrimary,
-                        theme.bgElevated, 0, 44,
-                        new View.OnClickListener() {
-                            @Override
-                            public void onClick(View v) {
-                                if (gatewayService != null) {
-                                    gatewayService.sendRemoteRoomCommandAsync(r.host, r.webPort, "下一首", makeActionToast());
-                                }
-                            }
-                        }));
-                actions.addView(new View(this), new LinearLayout.LayoutParams(dp(6), 1));
-                actions.addView(UiTheme.circleIconButton(this, theme, Icons.Name.STOP, theme.destructive,
-                        theme.destructiveSoft, 0, 44,
-                        new View.OnClickListener() {
-                            @Override
-                            public void onClick(View v) {
-                                if (gatewayService != null) {
-                                    gatewayService.stopRemoteRoomAsync(r.host, r.webPort, r.activeDeviceId, makeActionToast());
-                                }
-                            }
-                        }));
+                            }));
+                    actions.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
+                }
                 if (!r.activeDeviceId.isEmpty()) {
-                    actions.addView(new View(this), new LinearLayout.LayoutParams(dp(6), 1));
-                    actions.addView(UiTheme.circleIconButton(this, theme, Icons.Name.VOLUME, theme.textPrimary,
-                            theme.bgElevated, 0, 44,
+                    String volLabel = (volPct != null)
+                            ? (tr("rooms_vol_short") + " " + volPct + "%")
+                            : tr("rooms_vol_short");
+                    actions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.VOLUME, volLabel,
+                            theme.bgElevated, theme.textPrimary, 0,
                             new View.OnClickListener() {
                                 @Override public void onClick(View v) { showRoomVolumeDialog(r); }
                             }));
+                    actions.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
                 }
-                actions.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
                 actions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.SEND, tr("rooms_cmd_btn"),
-                        theme.accentSoft, theme.accent, 0,
+                        theme.bgElevated, theme.textPrimary, 0,
                         new View.OnClickListener() {
                             @Override public void onClick(View v) { showRoomCommandDialog(r); }
                         }));
-                actions.addView(new View(this), new LinearLayout.LayoutParams(dp(8), 1));
-            }
-
-            if (!isActive) {
-                actions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.CHECK, tr("rooms_switch_btn"),
-                        theme.bgElevated, theme.textPrimary, 0,
+            } else if (!isActive) {
+                actions.addView(UiTheme.iconTextPill(this, theme, null, tr("rooms_switch_short"),
+                        theme.bgElevated, theme.textSecondary, 0,
                         new View.OnClickListener() {
                             @Override
                             public void onClick(View v) {
-                                switchActiveCore(r.displayName, r.host, r.gatewayPort, r.webPort, r.coreId, null);
+                                switchActiveCore(r.displayName, r.host, r.gatewayPort, r.webPort, r.coreId, null,
+                                        DeviceRoutingPolicy.resolveManageOnlyForRoomSwitch(
+                                                r.online, r.authRequired, r.voiceGatewayOpen));
                             }
                         }));
             }
@@ -1669,14 +2420,24 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private GatewayService.ActionResultCallback makeActionToast() {
         return new GatewayService.ActionResultCallback() {
             @Override
-            public void onActionDone(final boolean ok) {
+            public void onActionDone(final boolean ok, final boolean authRequired) {
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
                         if (!isFinishing() && !isDestroyed()) {
+                            boolean authNeeded = !ok && authRequired;
                             Toast.makeText(MainActivity.this,
-                                    ok ? tr("rooms_cmd_sent") : tr("rooms_cmd_failed"),
+                                    ok ? tr("rooms_cmd_sent")
+                                            : (authNeeded ? tr("auth_action_required_toast") : tr("rooms_cmd_failed")),
                                     Toast.LENGTH_SHORT).show();
+                            if (ok) {
+                                refreshWholeHomeRoomCards();
+                                if (gatewayService != null) {
+                                    gatewayService.refreshCoreSnapshotNow();
+                                }
+                            } else if (authNeeded) {
+                                scheduleUiRefresh();
+                            }
                         }
                     }
                 });
@@ -1686,10 +2447,18 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
 
     private void switchActiveCore(
             String name, String host, int gwPort, int webPort, String coreId, List<String> altHosts) {
+        switchActiveCore(name, host, gwPort, webPort, coreId, altHosts, null);
+    }
+
+    private void switchActiveCore(
+            String name, String host, int gwPort, int webPort, String coreId, List<String> altHosts, Boolean manageOnly) {
         String existingTok = config.getBearerTokenForHost(host);
-        config.upsertProfileAndSelect(name, host, gwPort, webPort, existingTok, coreId, altHosts);
+        config.upsertProfileAndSelect(name, host, gwPort, webPort, existingTok, coreId, altHosts, manageOnly);
         if (tvConsoleUrl != null) tvConsoleUrl.setText(config.getWebConsoleUrl());
         if (gatewayService != null) gatewayService.reloadConfigAndReconnect();
+        if (activeTab == TAB_CONSOLE || webView != null) {
+            ensureWebViewLoaded(true);
+        }
         refreshProfilesList();
         renderWholeHomeRoomCards(latestRoomSummaries);
         scheduleUiRefresh();
@@ -1710,28 +2479,111 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private void showRoomTokenDialog(final CoreApiClient.RoomNodeSummary room) {
         LinearLayout form = new LinearLayout(this);
         form.setOrientation(LinearLayout.VERTICAL);
-        form.setPadding(dp(20), dp(14), dp(20), dp(6));
+        form.setPadding(dp(20), dp(12), dp(20), dp(6));
+
+        TextView tvHelper = new TextView(this);
+        tvHelper.setText(tr("rooms_token_desc"));
+        tvHelper.setTextColor(theme.textSecondary);
+        tvHelper.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tvHelper.setLineSpacing(dp(2), 1.0f);
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hlp.bottomMargin = dp(12);
+        form.addView(tvHelper, hlp);
 
         final EditText etToken = UiTheme.themedEditText(this, theme,
                 tr("settings_profile_token_hint"), config.getBearerTokenForHost(room.host));
+        etToken.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        etToken.setSingleLine(true);
         form.addView(etToken);
 
-        showTrackedDialog(UiTheme.dialog(this, theme)
+        final TextView tvStatus = new TextView(this);
+        tvStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tvStatus.setVisibility(View.GONE);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.topMargin = dp(2);
+        form.addView(tvStatus, slp);
+
+        final AlertDialog dialog = UiTheme.dialog(this, theme)
                 .setTitle(tr("rooms_token_title") + " · " + room.displayName)
                 .setView(form)
-                .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        config.setProfileBearerToken(room.host, etToken.getText().toString().trim());
-                        if (room.host.equalsIgnoreCase(config.getCoreHost()) && gatewayService != null) {
-                            gatewayService.reloadConfigAndReconnect();
-                        }
-                        refreshProfilesList();
-                        refreshWholeHomeRoomCards();
-                    }
-                })
+                .setPositiveButton(tr("rooms_token_verify_btn"), null)
                 .setNegativeButton(android.R.string.cancel, null)
-                .create());
+                .create();
+        showTrackedDialog(dialog);
+
+        final Button btnVerify = dialog.getButton(DialogInterface.BUTTON_POSITIVE);
+        if (btnVerify != null) {
+            btnVerify.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    final String sanitized = CoreApiClient.sanitizeBearerToken(etToken.getText().toString());
+                    if (sanitized.isEmpty()) {
+                        tvStatus.setText(tr("rooms_token_empty_err"));
+                        tvStatus.setTextColor(theme.destructive);
+                        tvStatus.setVisibility(View.VISIBLE);
+                        return;
+                    }
+                    if (gatewayService == null) {
+                        config.setProfileBearerToken(room.host, sanitized);
+                        dialog.dismiss();
+                        return;
+                    }
+                    btnVerify.setEnabled(false);
+                    etToken.setEnabled(false);
+                    tvStatus.setText(tr("rooms_token_verifying"));
+                    tvStatus.setTextColor(theme.textSecondary);
+                    tvStatus.setVisibility(View.VISIBLE);
+
+                    gatewayService.verifyRoomTokenAsync(
+                            room.host, room.webPort, sanitized,
+                            new GatewayService.TokenVerifyCallback() {
+                                @Override
+                                public void onTokenVerified(
+                                        final CoreApiClient.TokenVerifyResult result,
+                                        final String cleanToken) {
+                                    runOnUiThread(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            if (isFinishing() || isDestroyed() || !dialog.isShowing()) {
+                                                return;
+                                            }
+                                            if (result != null && result.ok) {
+                                                String verifiedCoreId = !result.coreId.isEmpty() ? result.coreId : room.coreId;
+                                                config.setProfileBearerToken(room.host, cleanToken, verifiedCoreId);
+                                                if (config.activeProfileMatchesHost(room.host)) {
+                                                    if (gatewayService != null) {
+                                                        gatewayService.reloadConfigAndReconnect();
+                                                    }
+                                                    if (activeTab == TAB_CONSOLE || webView != null) {
+                                                        ensureWebViewLoaded(true);
+                                                    }
+                                                }
+                                                refreshProfilesList();
+                                                refreshWholeHomeRoomCards();
+                                                scheduleUiRefresh();
+                                                dialog.dismiss();
+                                                Toast.makeText(MainActivity.this,
+                                                        tr("rooms_token_verified_ok"),
+                                                        Toast.LENGTH_SHORT).show();
+                                            } else {
+                                                btnVerify.setEnabled(true);
+                                                etToken.setEnabled(true);
+                                                boolean invalid = result != null && result.authRequired;
+                                                tvStatus.setText(invalid
+                                                        ? tr("rooms_token_invalid_err")
+                                                        : tr("rooms_token_unreachable_err"));
+                                                tvStatus.setTextColor(theme.destructive);
+                                                tvStatus.setVisibility(View.VISIBLE);
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                }
+            });
+        }
     }
 
     private void showRoomVolumeDialog(final CoreApiClient.RoomNodeSummary room) {
@@ -1739,8 +2591,12 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(22), dp(18), dp(22), dp(8));
 
+        int initialPct = (room.volume != null && !Double.isNaN(room.volume) && !Double.isInfinite(room.volume))
+                ? Math.max(0, Math.min(100, (int) Math.round(room.volume * 100.0)))
+                : 50;
+
         final TextView tvPct = new TextView(this);
-        tvPct.setText("50%");
+        tvPct.setText(initialPct + "%");
         tvPct.setTextColor(theme.textPrimary);
         tvPct.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
         tvPct.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
@@ -1750,7 +2606,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
 
         final SeekBar sb = new SeekBar(this);
         sb.setMax(100);
-        sb.setProgress(50);
+        sb.setProgress(initialPct);
         UiTheme.styleSeekBar(sb, theme);
         sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
@@ -1849,14 +2705,19 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         if (gatewayService == null) return;
         gatewayService.applyDeviceModeAsync(duplex, bargeIn, wakeAck, wakeArb, new GatewayService.ModeApplyCallback() {
             @Override
-            public void onModeApplied(final boolean ok) {
+            public void onModeApplied(final boolean ok, final boolean authRequired) {
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
                         if (!isFinishing() && !isDestroyed()) {
+                            boolean authNeeded = !ok && authRequired;
                             Toast.makeText(MainActivity.this,
-                                    ok ? tr("mode_saved") : tr("mode_save_failed"),
+                                    ok ? tr("mode_saved")
+                                            : (authNeeded ? tr("auth_action_required_toast") : tr("mode_save_failed")),
                                     Toast.LENGTH_SHORT).show();
+                            if (authNeeded) {
+                                scheduleUiRefresh();
+                            }
                         }
                     }
                 });
@@ -1937,7 +2798,13 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                 ws.setUseWideViewPort(true);
                 ws.setLoadWithOverviewMode(true);
                 webView.setWebChromeClient(new WebChromeClient());
-                webView.setWebViewClient(new WebViewClient());
+                webView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onPageFinished(WebView view, String loadedUrl) {
+                        super.onPageFinished(view, loadedUrl);
+                        injectConsoleTokenIfOriginMatches(view, loadedUrl);
+                    }
+                });
                 webViewHost.removeAllViews();
                 webViewHost.addView(webView, new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -1959,9 +2826,64 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             webViewHost.addView(webView, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         }
-        if (webView != null && (forceReload || !url.equals(lastLoadedWebUrl))) {
+        String activeToken = config.getBearerToken();
+        if (webView != null && (forceReload || !url.equals(lastLoadedWebUrl) || !activeToken.equals(lastLoadedWebToken))) {
             lastLoadedWebUrl = url;
+            lastLoadedWebToken = activeToken;
             webView.loadUrl(url);
+        }
+    }
+
+    private static String normalizedOrigin(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) {
+            return "";
+        }
+        try {
+            java.net.URI u = new java.net.URI(rawUrl.trim());
+            String scheme = u.getScheme() != null ? u.getScheme().toLowerCase(java.util.Locale.US) : "";
+            String host = u.getHost() != null ? u.getHost().toLowerCase(java.util.Locale.US) : "";
+            if (scheme.isEmpty() || host.isEmpty()) {
+                return "";
+            }
+            int port = u.getPort();
+            if (port < 0) {
+                port = "https".equals(scheme) ? 443 : 80;
+            }
+            return scheme + "://" + host + ":" + port;
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    /**
+     * Seeds or clears {@code window.localStorage['hm.api.token']} ONLY when the WebView is on
+     * the currently selected Core's exact normalized origin (scheme + host + port), reloading once
+     * if the stored token changed so the Vue Console unlocks automatically with the Android app's
+     * paired Bearer token (P1-15). When Android has no saved token for the active Core, any token
+     * entered directly inside the Web Console is preserved unless Android previously injected one.
+     */
+    private void injectConsoleTokenIfOriginMatches(WebView view, String loadedUrl) {
+        if (view == null || loadedUrl == null || loadedUrl.isEmpty()) {
+            return;
+        }
+        String expectedOrigin = normalizedOrigin(config.getWebConsoleUrl());
+        String actualOrigin = normalizedOrigin(loadedUrl);
+        if (expectedOrigin.isEmpty() || !expectedOrigin.equals(actualOrigin)) {
+            return;
+        }
+        String desired = config.getBearerToken();
+        String desiredJson = homes.mymate.gateway.protocol.MiniJson.stringify(desired != null ? desired : "");
+        String js = "(function(){try{"
+                + "var k='hm.api.token',m='hm.android.injected';"
+                + "var d=" + desiredJson + ";"
+                + "var c=window.localStorage.getItem(k)||'';"
+                + "if(d){if(c!==d){window.localStorage.setItem(k,d);window.localStorage.setItem(m,'1');window.location.reload();}}"
+                + "else if(window.localStorage.getItem(m)==='1'){window.localStorage.removeItem(m);if(c){window.localStorage.removeItem(k);window.location.reload();}}"
+                + "}catch(e){}})();";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            view.evaluateJavascript(js, null);
+        } else {
+            view.loadUrl("javascript:" + js);
         }
     }
 
@@ -2097,16 +3019,16 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         paLp.topMargin = dp(10);
 
-        profileActions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.WIFI, tr("settings_scan_lan"),
+        profileActions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.SETTINGS, tr("settings_add_profile"),
                 theme.primaryBg, theme.primaryFg, 0,
                 new View.OnClickListener() {
-                    @Override public void onClick(View v) { runLanScanWithDialog(); }
+                    @Override public void onClick(View v) { showCustomProfileDialog(null); }
                 }));
         profileActions.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
-        profileActions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.SETTINGS, tr("settings_add_profile"),
-                theme.bgElevated, theme.textPrimary, 0,
+        profileActions.addView(UiTheme.iconTextPill(this, theme, Icons.Name.WIFI, tr("rooms_scan_short"),
+                theme.bgElevated, theme.textSecondary, 0,
                 new View.OnClickListener() {
-                    @Override public void onClick(View v) { showCustomProfileDialog(null); }
+                    @Override public void onClick(View v) { runLanScanWithDialog(); }
                 }));
         profileCard.addView(profileActions, paLp);
         body.addView(profileCard);
@@ -2249,7 +3171,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                     public void onClick(View v) {
                         float g = deviceProfile.recommendedGain;
                         float t = deviceProfile.recommendedKwsThreshold;
-                        float s = 2.60f;
+                        float s = 3.00f;
                         config.saveAcoustics(true, false, g, t, s);
                         swHwAec.setChecked(true);
                         swSwAec.setChecked(false);
@@ -2473,7 +3395,8 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             LinearLayout meta = new LinearLayout(this);
             meta.setOrientation(LinearLayout.VERTICAL);
             TextView tvName = new TextView(this);
-            tvName.setText(p.name + (!p.bearerToken.isEmpty() ? " · " + tr("profile_paired") : ""));
+            String modeTag = p.manageOnly ? (" · " + tr("badge_manage_only")) : "";
+            tvName.setText(p.name + modeTag + (!p.bearerToken.isEmpty() ? " · " + tr("profile_paired") : ""));
             tvName.setTextColor(active ? theme.accent : theme.textPrimary);
             tvName.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
             tvName.setTypeface(active ? Typeface.create("sans-serif-medium", Typeface.NORMAL) : Typeface.DEFAULT);
@@ -2537,7 +3460,8 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             row.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
-                    switchActiveCore(p.name, p.host, p.gatewayPort, p.webPort, p.coreId, p.alternateHosts);
+                    switchActiveCore(p.name, p.host, p.gatewayPort, p.webPort, p.coreId, p.alternateHosts,
+                            Boolean.valueOf(p.manageOnly));
                 }
             });
             profilesContainer.addView(row);
@@ -2563,12 +3487,12 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         for (int i = 0; i < profiles.size(); i++) {
             GatewayConfig.ServerProfile p = profiles.get(i);
             boolean active = p.matchesHost(activeHost);
-            String capTag = "";
+            String capTag = p.manageOnly ? (" · " + tr("badge_manage_only")) : "";
             for (CoreDiscovery.DiscoveredCore d : discovered) {
                 boolean match = (!d.coreId.isEmpty() && d.coreId.equalsIgnoreCase(p.coreId))
                         || p.matchesHost(d.host);
                 if (match) {
-                    capTag = " · " + (d.voiceGatewayOpen ? tr("badge_voice_manage") : tr("badge_manage_only"));
+                    capTag = " · " + ((d.voiceGatewayOpen && !p.manageOnly) ? tr("badge_voice_manage") : tr("badge_manage_only"));
                     if (d.lanGatewayExempt && !d.authRequired) {
                         capTag = capTag + " · " + tr("badge_lan_exempt");
                     }
@@ -2585,7 +3509,8 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
                         GatewayConfig.ServerProfile p = profiles.get(which);
-                        switchActiveCore(p.name, p.host, p.gatewayPort, p.webPort, p.coreId, p.alternateHosts);
+                        switchActiveCore(p.name, p.host, p.gatewayPort, p.webPort, p.coreId, p.alternateHosts,
+                                Boolean.valueOf(p.manageOnly));
                     }
                 })
                 .setPositiveButton(tr("settings_add_profile"), new DialogInterface.OnClickListener() {
@@ -2601,8 +3526,18 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     }
 
     private void runLanScanWithDialog() {
-        if (gatewayService == null) return;
-        Toast.makeText(this, tr("rooms_scanning"), Toast.LENGTH_SHORT).show();
+        runLanScanWithDialog(true);
+    }
+
+    private void runLanScanWithDialog(boolean showStartToast) {
+        if (gatewayService == null) {
+            pendingLanScanAction = PENDING_LAN_SCAN_DIALOG;
+            Toast.makeText(this, tr("rooms_scanning"), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (showStartToast) {
+            Toast.makeText(this, tr("rooms_scanning"), Toast.LENGTH_SHORT).show();
+        }
         gatewayService.discoverLanCoresAsync(false, new GatewayService.DiscoveryCallback() {
             @Override
             public void onCoresDiscovered(final List<CoreDiscovery.DiscoveredCore> cores) {
@@ -2611,6 +3546,8 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                     public void run() {
                         if (isFinishing() || isDestroyed()) return;
                         refreshProfilesList();
+                        refreshWholeHomeRoomCards();
+                        scheduleUiRefresh();
                         if (cores.isEmpty()) {
                             Toast.makeText(MainActivity.this, tr("settings_no_lan_core"), Toast.LENGTH_SHORT).show();
                             return;
@@ -2623,7 +3560,8 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                                     @Override
                                     public void onClick(DialogInterface dialog, int which) {
                                         CoreDiscovery.DiscoveredCore c = cores.get(which);
-                                        switchActiveCore(c.displayLabel(), c.host, c.gatewayPort, c.webPort, c.coreId, c.alternateHosts);
+                                        switchActiveCore(c.displayLabel(), c.host, c.gatewayPort, c.webPort, c.coreId, c.alternateHosts,
+                                                Boolean.valueOf(!c.voiceGatewayOpen));
                                         if (c.authRequired && config.getBearerTokenForHost(c.host).isEmpty()) {
                                             showActiveCoreTokenDialog();
                                         }
@@ -2660,6 +3598,16 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                 editing != null ? editing.bearerToken : "");
         form.addView(etToken);
 
+        final Switch swManageOnly = new Switch(this);
+        swManageOnly.setText(tr("settings_profile_manage_only"));
+        swManageOnly.setTextColor(theme.textPrimary);
+        swManageOnly.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        swManageOnly.setChecked(editing != null && editing.manageOnly);
+        LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        swLp.topMargin = dp(10);
+        form.addView(swManageOnly, swLp);
+
         showTrackedDialog(UiTheme.dialog(this, theme)
                 .setTitle(editing != null ? tr("settings_edit_profile") : tr("settings_add_profile"))
                 .setView(form)
@@ -2673,14 +3621,37 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                         String name = etName.getText().toString().trim();
                         int gw = parseIntSafe(etGwPort.getText().toString(), 8932);
                         int web = parseIntSafe(etWebPort.getText().toString(), 8930);
-                        String tok = etToken.getText().toString().trim();
+                        String tok = CoreApiClient.sanitizeBearerToken(etToken.getText().toString());
+                        Boolean manageOnly = Boolean.valueOf(swManageOnly.isChecked());
                         if (editing != null) {
-                            config.updateServerProfile(editing.host, name.isEmpty() ? host : name, host, gw, web, tok);
+                            config.updateServerProfile(editing.host, name.isEmpty() ? host : name, host, gw, web, tok, manageOnly);
                         } else {
-                            config.upsertProfileAndSelect(name.isEmpty() ? host : name, host, gw, web, tok, null, null);
+                            config.upsertProfileAndSelect(name.isEmpty() ? host : name, host, gw, web, tok, null, null, manageOnly);
+                        }
+                        boolean needsCoreIdPin = !tok.isEmpty()
+                                && (editing == null || editing.coreId.isEmpty() || !editing.matchesHost(host));
+                        if (needsCoreIdPin && gatewayService != null) {
+                            final String savedHost = host;
+                            gatewayService.verifyRoomTokenAsync(savedHost, web, tok, new GatewayService.TokenVerifyCallback() {
+                                @Override
+                                public void onTokenVerified(final CoreApiClient.TokenVerifyResult result, final String cleanToken) {
+                                    if (result != null && result.ok && !result.coreId.isEmpty()) {
+                                        config.setProfileBearerToken(savedHost, cleanToken, result.coreId);
+                                        runOnUiThread(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                if (!isFinishing() && !isDestroyed()) {
+                                                    refreshWholeHomeRoomCards();
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            });
                         }
                         if (gatewayService != null) gatewayService.reloadConfigAndReconnect();
                         refreshProfilesList();
+                        refreshWholeHomeRoomCards();
                         scheduleUiRefresh();
                     }
                 })
@@ -2737,14 +3708,15 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             sb.append("KWS Engine: ").append(gatewayService.getKwsEngineMode())
               .append(" (hits=").append(gatewayService.getKwsDetectionCount()).append(")\n")
               .append("Hardware Adapter: ").append(gatewayService.getHardwareAdapterName()).append("\n")
-              .append("Mode: ").append(gatewayService.isConnected() ? "Voice+Manage"
-                      : (gatewayService.isHttpManageOnline() ? "Manage-Only" : "Offline")).append("\n")
+              .append("Mode: ").append(gatewayService.isManageOnlyMode()
+                      ? (gatewayService.isHttpManageOnline() ? "Manage-Only" : "Manage-Only (Offline)")
+                      : (gatewayService.isConnected() ? "Voice+Manage" : "Voice (Reconnecting)")).append("\n")
               .append("Form Factor: ").append(deviceProfile.effectiveFormFactor.id)
               .append(" (").append(deviceProfile.widthDp).append("x").append(deviceProfile.heightDp).append("dp)\n")
               .append("Audio Route: ").append(gatewayService.getOutputRouteName())
               .append(" · HW-AEC=").append(gatewayService.isHardwareAecActive())
-              .append(" · SW-AEC=").append(gatewayService.isSoftwareAecActive())
-              .append(String.format(Locale.US, " (ERLE=%.1fdB)\n", gatewayService.getSoftwareAecErleDb()))
+              .append(" · SW-AEC=").append(gatewayService.isSoftwareAecActive()).append("\n")
+              .append("KWS/SW AEC: ").append(gatewayService.getActiveAecTelemetry().formatCompact()).append("\n")
               .append("Blocks Sent: ").append(gatewayService.getBlocksSent()).append("\n\n")
               .append(gatewayService.getProtocolLogText());
         }
@@ -2774,6 +3746,10 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                         if (isFinishing() || isDestroyed()) return;
                         if (info.error != null) {
                             Toast.makeText(MainActivity.this, tr("settings_update_failed") + info.error, Toast.LENGTH_SHORT).show();
+                        } else if (info.noReleaseYet) {
+                            Toast.makeText(MainActivity.this,
+                                    tr("settings_update_no_release") + AppUpdater.getCurrentVersionName(MainActivity.this),
+                                    Toast.LENGTH_LONG).show();
                         } else if (info.available) {
                             showTrackedDialog(UiTheme.dialog(MainActivity.this, theme)
                                     .setTitle(tr("settings_update_available") + info.latestVersionName)
@@ -2807,6 +3783,24 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
 
     private void requestBatteryOptimizationExemption() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (isIgnoringBatteryOptimizations()) {
+                // Android does not allow apps to self-revoke battery exemption; firing
+                // ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS when already exempt is a silent no-op.
+                // Open App Details (where Battery -> Unrestricted/Optimized/Restricted lives) with
+                // fallback to the system Battery Optimization list.
+                Toast.makeText(this, tr("settings_battery_manage_toast"), Toast.LENGTH_LONG).show();
+                try {
+                    Intent details = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                    details.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(details);
+                } catch (Throwable ignored) {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                    } catch (Throwable ignored2) {
+                    }
+                }
+                return;
+            }
             try {
                 Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
                 intent.setData(Uri.parse("package:" + getPackageName()));
@@ -2815,6 +3809,12 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                 try {
                     startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
                 } catch (Throwable ignored2) {
+                    try {
+                        Intent details = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                        details.setData(Uri.parse("package:" + getPackageName()));
+                        startActivity(details);
+                    } catch (Throwable ignored3) {
+                    }
                 }
             }
         }
@@ -2844,8 +3844,13 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             return;
         }
         boolean voiceConnected = gatewayService.isConnected();
-        boolean manageOnline = gatewayService.isHttpManageOnline();
+        boolean manageOnly = gatewayService.isManageOnlyMode();
+        boolean manageOnline = manageOnly && gatewayService.isHttpManageOnline();
         boolean anyOnline = gatewayService.isAnyOnline();
+        String transientErr = gatewayService.consumeTransientError();
+        if (transientErr != null && !transientErr.isEmpty()) {
+            Toast.makeText(this, transientErr, Toast.LENGTH_SHORT).show();
+        }
         boolean muted = gatewayService.isMuted();
         String state = gatewayService.getAssistantState();
         double rms = gatewayService.getLastRmsDbfs();
@@ -2893,20 +3898,81 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
             heroOrb.updateState(anyOnline, muted, state, musicActive, rms);
         }
         setTextIfChanged(tvOrbState, stateLabel);
-        if (btnMuteCircle != null && muted != lastMuteRendered) {
+        if (muted != lastMuteRendered) {
             lastMuteRendered = muted;
-            btnMuteCircle.setImageDrawable(Icons.of(
-                    Icons.Name.MIC_OFF,
-                    muted ? theme.destructive : theme.textSecondary,
-                    dp(20)));
-            btnMuteCircle.setBackground(UiTheme.ripplePill(
-                    theme,
-                    muted ? theme.destructiveSoft : theme.bgSurface,
-                    muted ? theme.destructive : theme.borderSubtle,
-                    UiTheme.hairlinePx(this)));
+            if (btnMuteCircle != null) {
+                btnMuteCircle.setImageDrawable(Icons.of(
+                        Icons.Name.MIC_OFF,
+                        muted ? theme.destructive : theme.textSecondary,
+                        dp(20)));
+                btnMuteCircle.setBackground(UiTheme.ripplePill(
+                        theme,
+                        muted ? theme.destructiveSoft : theme.bgSurface,
+                        muted ? theme.destructive : theme.borderSubtle,
+                        UiTheme.hairlinePx(this)));
+            }
+            if (btnMusicMute != null) {
+                btnMusicMute.setImageDrawable(Icons.of(
+                        Icons.Name.MIC_OFF,
+                        muted ? theme.destructive : theme.textSecondary,
+                        dp(18)));
+                btnMusicMute.setBackground(UiTheme.ripplePill(
+                        theme,
+                        muted ? theme.destructiveSoft : theme.bgElevated,
+                        muted ? theme.destructive : theme.borderSubtle,
+                        UiTheme.hairlinePx(this)));
+            }
         }
 
-        updateMusicStagePresentation(musicActive, snap.musicTitle, snap.musicSource);
+        updateMusicStagePresentation(musicActive, snap.musicPaused, snap.musicTitle, snap.musicSource);
+
+        // Manage-Only pending confirmation prompt (P1-13)
+        final GatewayService.PendingConfirmation pendingConfirm = gatewayService.getPendingConfirmation();
+        if (pendingConfirm != null
+                && config.activeProfileMatchesHost(pendingConfirm.host)
+                && !pendingConfirm.actionId.equals(lastPromptedConfirmationId)) {
+            lastPromptedConfirmationId = pendingConfirm.actionId;
+            String msg = !pendingConfirm.summary.isEmpty()
+                    ? pendingConfirm.summary
+                    : (!pendingConfirm.tool.isEmpty() ? pendingConfirm.tool : pendingConfirm.actionId);
+            showTrackedDialog(UiTheme.dialog(this, theme)
+                    .setTitle(tr("confirm_action_title"))
+                    .setMessage(msg)
+                    .setPositiveButton(tr("confirm_action_approve"), new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            if (gatewayService != null) {
+                                gatewayService.decidePendingConfirmationAsync(pendingConfirm, true, makeActionToast());
+                            }
+                        }
+                    })
+                    .setNegativeButton(tr("confirm_action_deny"), new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            if (gatewayService != null) {
+                                gatewayService.decidePendingConfirmationAsync(pendingConfirm, false, makeActionToast());
+                            }
+                        }
+                    })
+                    .setNeutralButton(tr("tab_console"), new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            if (gatewayService != null) {
+                                gatewayService.dismissPendingConfirmation(pendingConfirm.actionId);
+                            }
+                            selectTab(TAB_CONSOLE);
+                        }
+                    })
+                    .setOnCancelListener(new DialogInterface.OnCancelListener() {
+                        @Override
+                        public void onCancel(DialogInterface dialog) {
+                            if (gatewayService != null) {
+                                gatewayService.dismissPendingConfirmation(pendingConfirm.actionId);
+                            }
+                        }
+                    })
+                    .create());
+        }
 
         // Clean Human-Only Slim Dialogue Ticker
         latestCleanTranscript = snap.transcript;
@@ -2915,7 +3981,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
         // StandBy Overlay (always pure OLED dark)
         if (standByActive && standByOverlay != null) {
             standByOverlay.update(lang(), anyOnline, muted, state, rms, stateLabel,
-                    musicActive, snap.musicTitle);
+                    musicActive, snap.musicPaused, snap.musicTitle);
         }
 
         // Rooms Tab
@@ -2989,7 +4055,21 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
     private void renderRoomsTab(CoreApiClient.CoreSnapshot snap, double rms, double floor, double snr) {
         updatingControlsFromSnapshot = true;
         try {
-            int volPct = (int) Math.round(gatewayService.getVolumeLinear() * 100.0);
+            if (roomsActiveControlsSection != null) {
+                roomsActiveControlsSection.setVisibility(config.hasConfiguredCore() ? View.VISIBLE : View.GONE);
+            }
+            if (roomsArbSection != null) {
+                boolean showArb = latestRoomSummaries.size() > 1
+                        || (snap != null && snap.fleetNodes != null && !snap.fleetNodes.isEmpty());
+                roomsArbSection.setVisibility(showArb ? View.VISIBLE : View.GONE);
+            }
+            double displayVol = gatewayService.getVolumeLinear();
+            Double remoteVol = DeviceRoutingPolicy.resolveRemoteDisplayVolume(
+                    gatewayService.isManageOnlyMode(), snap);
+            if (remoteVol != null) {
+                displayVol = remoteVol.doubleValue();
+            }
+            int volPct = (int) Math.round(displayVol * 100.0);
             if (!roomsVolumeSlider.isPressed()) {
                 if (roomsVolumeSlider.getProgress() != volPct) {
                     roomsVolumeSlider.setProgress(volPct);
@@ -3024,6 +4104,7 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                     tv.setText(config.getDeviceId() + " (" + config.getDeviceModel() + ")");
                     tv.setTextColor(theme.textSecondary);
                     tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                    tv.setPadding(0, dp(6), 0, dp(4));
                     devicesListContainer.addView(tv);
                 } else {
                     for (int i = 0; i < snap.devices.size(); i++) {
@@ -3060,44 +4141,6 @@ public final class MainActivity extends Activity implements GatewayService.UiTel
                                 theme.bgElevated, theme.textSecondary);
                         row.addView(tag);
                         devicesListContainer.addView(row);
-                    }
-                }
-            }
-
-            StringBuilder fleetFp = new StringBuilder();
-            for (CoreApiClient.FleetNodeInfo f : snap.fleetNodes) {
-                fleetFp.append(f.id).append(':').append(f.healthy).append(':').append(f.url).append(';');
-            }
-            String nextFleetFp = fleetFp.toString();
-            if (!nextFleetFp.equals(lastFleetFingerprint)) {
-                lastFleetFingerprint = nextFleetFp;
-                fleetListContainer.removeAllViews();
-                boolean hasFleet = !snap.fleetNodes.isEmpty();
-                if (fleetSectionHeading != null) {
-                    fleetSectionHeading.setVisibility(hasFleet ? View.VISIBLE : View.GONE);
-                }
-                fleetListContainer.setVisibility(hasFleet ? View.VISIBLE : View.GONE);
-                if (hasFleet) {
-                    for (int i = 0; i < snap.fleetNodes.size(); i++) {
-                        CoreApiClient.FleetNodeInfo f = snap.fleetNodes.get(i);
-                        if (i > 0) fleetListContainer.addView(UiTheme.hairlineDivider(this, theme));
-                        LinearLayout row = new LinearLayout(this);
-                        row.setOrientation(LinearLayout.HORIZONTAL);
-                        row.setGravity(Gravity.CENTER_VERTICAL);
-                        row.setPadding(0, dp(8), 0, dp(8));
-
-                        View dot = new View(this);
-                        dot.setBackground(UiTheme.pill(f.healthy ? theme.statusOnline : theme.destructive, 0, 0));
-                        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(8), dp(8));
-                        dlp.rightMargin = dp(10);
-                        row.addView(dot, dlp);
-
-                        TextView tv = new TextView(this);
-                        tv.setText(f.id + " · " + f.url);
-                        tv.setTextColor(f.healthy ? theme.textPrimary : theme.destructive);
-                        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-                        row.addView(tv);
-                        fleetListContainer.addView(row);
                     }
                 }
             }

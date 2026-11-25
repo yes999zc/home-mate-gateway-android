@@ -171,7 +171,7 @@ def main() -> int:
                 {"kws_threshold": 0.30, "kws_score": 2.40},
             )
             deploy_resp = http_json("POST", f"{base_url}/api/v0/reflex/deploy", {"device": device_id})
-            assert deploy_resp.get("state") in ("sent", "installed", "loaded"), f"KWS deploy failed: {deploy_resp}"
+            assert deploy_resp.get("state") in ("sent", "installed", "loaded", "applied"), f"KWS deploy failed: {deploy_resp}"
 
             # Poll /api/v0/mode until Android Gateway's kws_deploy_receipt + kws_report update threshold=0.30, score=2.40
             kws_updated = False

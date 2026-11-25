@@ -29,6 +29,7 @@ public final class I18n {
         put("status_voice_manage", "在线 · 语音+管理", "Online · Voice & Manage");
         put("status_manage_only", "在线 · 管理模式", "Online · Manage Mode");
         put("status_offline", "离线重连中", "Reconnecting");
+        put("voice_disconnected_reconnect", "语音网关未连接，正在重连，请稍后再试", "Voice gateway disconnected — reconnecting, please retry");
         put("status_unconfigured", "未配置 Core · 点击扫描", "No Core · Tap to Scan");
         put("status_auth_required", "需要配对令牌 (401)", "Pairing Token Required (401)");
         put("badge_voice_manage", "语音+管理", "Voice + Manage");
@@ -43,6 +44,7 @@ public final class I18n {
         put("auth_banner_title", "当前 Core 需要配对令牌", "Pairing Token Required");
         put("auth_banner_desc", "请输入管理员令牌，或在 Core 控制台设置中开启「局域网免密」", "Enter your Bearer token, or enable LAN Exemption in Core Console Settings");
         put("auth_banner_btn", "输入令牌", "Enter Token");
+        put("auth_action_required_toast", "当前操作需要配对令牌 (401)，请点击主页横幅输入令牌", "Pairing token required (401) — tap the banner to enter your Bearer token");
 
         // Assistant states
         put("state_idle", "待命", "Ready");
@@ -55,6 +57,18 @@ public final class I18n {
         put("state_offline", "等待连接", "Offline");
         put("history_title", "对话记录", "Conversation");
         put("history_empty", "暂无对话记录", "No messages yet");
+        put("history_subtitle_fmt", "%s · %d 条记录", "%s · %d messages");
+        put("history_refreshing", "%s · 正在刷新...", "%s · Refreshing...");
+        put("history_empty_sub", "说「你好小智」唤醒，或在首页输入指令即可开始对话", "Say \"Ni Hao Xiao Zhi\" or type a message on the Voice tab to start");
+        put("history_refresh", "刷新", "Refresh");
+        put("history_earlier_session", "更早对话", "Earlier conversation");
+        put("history_current_session", "当前对话", "Current conversation");
+        put("history_auth_required", "需要配对令牌才能查看对话记录", "Pairing token required to view conversation history");
+        put("history_clear_title", "清空对话记录", "Clear Conversation History");
+        put("history_clear_confirm", "确定清空全部对话记录？首页底部的对话记录也会同步清除。", "Clear all conversation history? The home screen preview will also be cleared.");
+        put("history_clear_btn", "清空", "Clear");
+        put("history_cleared", "已清空对话记录", "Conversation history cleared");
+        put("history_clear_failed", "清空对话失败", "Failed to clear conversation");
         put("dialogue_ticker_hint", "说“你好小智”开始对话", "Say \"Ni Hao Xiao Zhi\" to begin");
         put("dialogue_tap_more", "查看全部", "History");
 
@@ -68,6 +82,7 @@ public final class I18n {
         put("input_hint", "输入文字直接对 Home Mate 说话...", "Type a message to Home Mate...");
         put("btn_send", "发送", "Send");
         put("now_playing", "正在播放", "Now Playing");
+        put("music_paused", "已暂停", "Paused");
         put("quick_weather", "今天天气", "Weather");
         put("quick_weather_cmd", "今天天气怎么样", "What is the weather today?");
         put("quick_music", "放首歌", "Play Music");
@@ -83,26 +98,49 @@ public final class I18n {
         put("role_assistant", "Home Mate", "Home Mate");
 
         // Rooms & Mode controls
-        put("rooms_whole_home_title", "全屋 Core 与房间控制", "Whole-Home Cores");
+        put("rooms_whole_home_title", "全屋设备", "Rooms");
+        put("rooms_count_fmt", "全屋设备 · %d 台", "Rooms · %d");
         put("rooms_scan_btn", "扫描局域网", "Scan LAN");
+        put("rooms_scan_short", "扫描", "Scan");
+        put("rooms_scan_primary", "扫描局域网设备", "Scan LAN Devices");
+        put("rooms_add_manual", "手动添加", "Add Manually");
         put("rooms_scanning", "正在扫描局域网全部 Core...", "Scanning LAN for all Cores...");
         put("rooms_found_fmt", "已发现 %d 台局域网 Core", "Found %d LAN Core(s)");
         put("rooms_cmd_btn", "发指令", "Command");
         put("rooms_switch_btn", "设为当前", "Set Active");
+        put("rooms_switch_here_btn", "切换至此", "Switch");
+        put("rooms_switch_short", "切换", "Switch");
         put("rooms_token_btn", "配置令牌", "Set Token");
+        put("rooms_enter_token_btn", "输入配对令牌", "Enter Token");
         put("rooms_token_title", "配置房间配对令牌", "Configure Room Bearer Token");
+        put("rooms_token_desc", "可在对应 Core 控制台的「设置 → 安全与令牌」中复制配对令牌", "Copy the Bearer token from Core Console → Settings → Security & Token");
+        put("rooms_token_verify_btn", "验证并配对", "Verify & Pair");
+        put("rooms_token_verifying", "正在验证令牌...", "Verifying token...");
+        put("rooms_token_verified_ok", "配对成功", "Paired successfully");
+        put("rooms_token_empty_err", "请输入配对令牌", "Please enter a pairing token");
+        put("rooms_token_invalid_err", "令牌无效，请核对设备令牌后重试", "Invalid token — please double-check and try again");
+        put("rooms_token_unreachable_err", "无法连接设备，请检查局域网连接", "Unable to reach device — check your local network");
+        put("rooms_need_token", "需要配对令牌", "Pairing token required");
+        put("rooms_active_online", "当前连接 · 在线", "Active · Online");
+        put("rooms_vol_short", "音量", "Vol");
+        put("rooms_active_controls_title", "当前房间控制", "Active Room Controls");
+        put("rooms_details_toggle", "设备与声学详情", "Devices & Acoustics");
         put("rooms_cmd_title_fmt", "向 %s 发送指令", "Command %s");
         put("rooms_volume_title_fmt", "调节 %s 音量", "Volume · %s");
         put("rooms_cmd_sent", "指令已发送", "Command sent");
         put("rooms_cmd_failed", "指令发送失败", "Command failed");
         put("rooms_room_offline", "离线", "Offline");
-        put("rooms_room_idle", "在线待命", "Online · Ready");
+        put("rooms_room_idle", "在线 · 待机", "Online · Idle");
         put("rooms_devices_title", "当前 Core 已连接终端", "Connected Devices");
         put("rooms_fleet_title", "多房间集群节点", "Multi-Room Fleet");
         put("rooms_mode_title", "当前终端交互模式", "Interaction Mode");
         put("mode_duplex", "对话双工模式", "Duplex Mode");
         put("mode_half", "半双工 (日常)", "Half Duplex");
-        put("mode_full", "全双工 (随时打断)", "Full Duplex");
+        put("mode_full", "全双工 (开发中)", "Full Duplex (In Dev)");
+        put("mode_full_dev_hint", "全双工仍在开发中，日常推荐使用半双工", "Full-duplex is in development; Half-Duplex is recommended daily");
+        put("mode_full_dev_confirm_title", "全双工模式开发中", "Full-Duplex In Development");
+        put("mode_full_dev_confirm_msg", "全双工随时打断功能仍在持续开发中，可能出现回声或误打断。日常使用推荐保持「半双工」。确定要体验全双工吗？", "Full-duplex interruption is still in active development and may experience echo or false triggers. Half-Duplex is recommended for daily use. Try it anyway?");
+        put("mode_full_dev_confirm_ok", "继续体验", "Try Anyway");
         put("mode_barge_in", "播放中语音打断", "Barge-In During Playback");
         put("mode_wake_ack", "唤醒应答提示音", "Wake Ack Tone");
         put("mode_wake_arb", "多房间唤醒仲裁", "Multi-Room Arbitration");
@@ -135,6 +173,7 @@ public final class I18n {
         put("settings_profile_gw_hint", "网关端口 (8932)", "Gateway Port (8932)");
         put("settings_profile_web_hint", "Web API 端口 (8930)", "Web API Port (8930)");
         put("settings_profile_token_hint", "配对令牌 (可选 Bearer Token)", "Bearer Token (optional)");
+        put("settings_profile_manage_only", "仅管理模式 (仅 HTTP，不连接语音网关)", "Manage-Only Mode (HTTP only, no voice gateway)");
         put("settings_routes_fmt", "备用路由: %s", "Fallback route: %s");
         put("settings_advanced_toggle", "高级声学与开发者诊断", "Advanced Acoustics & Diagnostics");
         put("profile_paired", "已配对", "Paired");
@@ -149,7 +188,7 @@ public final class I18n {
         put("settings_room_name", "房间名称", "Room Name");
         put("settings_device_id", "设备 ID", "Device ID");
         put("settings_acoustics_title", "离线 KWS 与回声消除", "Offline KWS & Echo Cancellation");
-        put("settings_sw_aec", "实验性软件回声消除 (NLMS)", "Experimental Software NLMS AEC");
+        put("settings_sw_aec", "实验性软件回声消除 (PBFDAF)", "Experimental Software PBFDAF AEC");
         put("settings_hw_aec", "硬件语音通信回声消除", "Hardware VoiceComm AEC");
         put("settings_uplink_gain", "麦克风增益", "Mic Uplink Gain");
         put("settings_kws_threshold", "KWS 触发阈值", "KWS Threshold");
@@ -161,13 +200,15 @@ public final class I18n {
         put("settings_preset_applied", "已恢复推荐声学参数", "Recommended acoustic preset applied");
         put("settings_system_title", "后台常驻与系统", "Background & System");
         put("settings_battery_opt", "关闭电池优化 (后台防杀)", "Disable Battery Optimization");
-        put("settings_battery_ok", "已豁免", "Exempt");
+        put("settings_battery_ok", "已豁免 · 点击管理", "Exempt · Manage");
         put("settings_battery_recommended", "建议开启", "Recommended");
+        put("settings_battery_manage_toast", "请在系统「电池」中调整或关闭后台不受限制", "Adjust or turn off battery exemption in System App Info → Battery");
         put("settings_kiosk_home", "86 墙面屏桌面常驻模式 (Kiosk Launcher)", "86 Wall Panel Kiosk Home Mode");
-        put("settings_check_update", "检查客户端更新", "Check App Updates");
+        put("settings_check_update", "检查更新 (GitHub)", "Check Updates (GitHub)");
         put("settings_update_available", "发现新版本 v", "New Version v");
         put("settings_update_download", "下载 APK", "Download APK");
         put("settings_update_latest", "已是最新版本: v", "Already latest: v");
+        put("settings_update_no_release", "GitHub 暂未发布正式版，当前为测试版 v", "No public GitHub Release yet; running preview v");
         put("settings_update_failed", "检查更新失败: ", "Update check failed: ");
         put("settings_diag_logs", "开发者协议与 KWS 诊断日志", "Developer Protocol & KWS Diagnostics");
         put("settings_save_reconnect", "保存并立即重连", "Save & Reconnect");
@@ -177,6 +218,17 @@ public final class I18n {
         put("kws_jni", "JNI 离线唤醒", "JNI Offline KWS");
         put("kws_sidecar", "Sidecar 离线唤醒", "Sidecar KWS");
         put("kws_hybrid", "云端混合唤醒", "Hybrid Wake");
+
+        // Manage-Only Confirmation Prompt
+        put("confirm_action_title", "操作需要确认", "Action Requires Confirmation");
+        put("confirm_action_approve", "批准并执行", "Approve & Execute");
+        put("confirm_action_deny", "拒绝", "Reject");
+        put("confirm_action_pending", "待确认操作：", "Pending confirmation: ");
+        put("confirm_action_pending_generic", "该操作需要你的确认后才会执行。", "This action requires your confirmation before executing.");
+        put("confirm_action_approved", "已批准并执行该操作。", "Action approved and executed.");
+        put("confirm_action_denied", "已拒绝该操作。", "Action rejected.");
+        put("confirm_action_approve_failed", "批准/执行操作失败（请检查配对令牌或前往控制台）。", "Failed to approve/execute action (check pairing token or open Console).");
+        put("confirm_action_deny_failed", "拒绝操作失败。", "Failed to reject action.");
     }
 
     private static void put(String key, String zh, String en) {

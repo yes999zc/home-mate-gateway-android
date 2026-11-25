@@ -111,6 +111,17 @@ public final class AcousticGuard {
             double noiseFloorDbfs,
             boolean bargeInEnabled,
             long nowMs) {
+        return pushCaptureBlockAndCheckBargeIn(
+                pcm16le, micRmsDbfs, noiseFloorDbfs, bargeInEnabled, false, nowMs);
+    }
+
+    public synchronized BargeInFact pushCaptureBlockAndCheckBargeIn(
+            byte[] pcm16le,
+            double micRmsDbfs,
+            double noiseFloorDbfs,
+            boolean bargeInEnabled,
+            boolean aecReferenceLocked,
+            long nowMs) {
         if (pcm16le == null || pcm16le.length == 0) {
             return null;
         }
@@ -135,14 +146,17 @@ public final class AcousticGuard {
         if (consecutiveBargeInFrames >= 3 && (nowMs - lastBargeInTriggeredMs) > 1200L) {
             consecutiveBargeInFrames = 0;
             lastBargeInTriggeredMs = nowMs;
-            // Honest telemetry: refLocked=false because no hardware AEC cross-correlation loop is locked
+            boolean freshRef = (this.lastRefUpdatedMs > 0L)
+                    && (nowMs - this.lastRefUpdatedMs) <= 300L
+                    && refDb > -50.0;
+            boolean refLocked = aecReferenceLocked && freshRef;
             return new BargeInFact(
                     snapshotPreroll(),
                     micRmsDbfs,
                     refDb,
                     residualDb,
                     0.0,
-                    false);
+                    refLocked);
         }
         return null;
     }

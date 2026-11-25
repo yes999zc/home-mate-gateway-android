@@ -62,6 +62,10 @@ public final class KwsAssetInstaller {
     }
 
     public static File prepareKwsWorkspace(Context context) {
+        return prepareKwsWorkspace(context, null);
+    }
+
+    public static File prepareKwsWorkspace(Context context, LocalKwsEngine engine) {
         File kwsDir = getKwsWorkDir(context);
         File modelDir = new File(kwsDir, "model");
         File libDir = new File(kwsDir, "lib");
@@ -83,7 +87,7 @@ public final class KwsAssetInstaller {
             copyAssetAtomically(am, assetPath, target, expectedLen);
         }
 
-        syncDefaultKeywordsFile(context, new File(kwsDir, "kw.txt"));
+        syncDefaultKeywordsFile(context, new File(kwsDir, "kw.txt"), engine);
 
         String nativeDirPath = context.getApplicationInfo().nativeLibraryDir;
         if (nativeDirPath != null) {
@@ -107,26 +111,38 @@ public final class KwsAssetInstaller {
         return kwsDir;
     }
 
-    private static void syncDefaultKeywordsFile(Context context, File kwFile) {
+    private static void syncDefaultKeywordsFile(Context context, File kwFile, LocalKwsEngine engine) {
         SharedPreferences prefs = context.getApplicationContext()
                 .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String newDefaultHash = NorthboundSession.fnv1a64Hex(LocalKwsEngine.DEFAULT_KEYWORDS_TXT);
         String prevDefaultHash = prefs.getString(KEY_BUNDLED_KW_HASH, "");
 
+        if (engine != null) {
+            String writtenHash = engine.syncDefaultKeywordsIfNotCustom(prevDefaultHash);
+            if (writtenHash != null && !writtenHash.isEmpty()) {
+                prefs.edit().putString(KEY_BUNDLED_KW_HASH, writtenHash).apply();
+            }
+            return;
+        }
+
+        File customMarker = new File(kwFile.getParentFile(), ".kw.custom");
+        if (customMarker.exists()) {
+            return;
+        }
+        String newDefaultHash = NorthboundSession.fnv1a64Hex(LocalKwsEngine.DEFAULT_KEYWORDS_TXT);
         boolean shouldWrite = false;
         if (!kwFile.exists() || kwFile.length() == 0) {
             shouldWrite = true;
-        } else if (!newDefaultHash.equals(prevDefaultHash)) {
-            // Upgrade bundled kw.txt ONLY if the current on-disk file still matches an older bundled default
-            // (or no bundled hash was recorded yet and it does not look custom-deployed)
+        } else if (!prevDefaultHash.isEmpty() && !newDefaultHash.equals(prevDefaultHash)) {
+            // Upgrade bundled kw.txt ONLY if the current on-disk file matches a previously recorded
+            // bundled default hash; NEVER overwrite an unknown or Core-deployed kw.txt!
             String currentDiskHash = readFileHash(kwFile);
-            if (prevDefaultHash.isEmpty() || prevDefaultHash.equals(currentDiskHash)) {
+            if (prevDefaultHash.equals(currentDiskHash)) {
                 shouldWrite = true;
             }
         }
 
         if (shouldWrite) {
-            File tmp = new File(kwFile.getParentFile(), "kw.txt.tmp");
+            File tmp = new File(kwFile.getParentFile(), "kw.default.tmp");
             try (FileOutputStream fos = new FileOutputStream(tmp)) {
                 fos.write(LocalKwsEngine.DEFAULT_KEYWORDS_TXT.getBytes(StandardCharsets.UTF_8));
                 fos.flush();

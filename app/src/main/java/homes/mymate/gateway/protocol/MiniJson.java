@@ -59,13 +59,7 @@ public final class MiniJson {
             } else if (d == Math.rint(d) && Math.abs(d) < 1e15 && !(value instanceof Float || value instanceof Double)) {
                 sb.append((long) d);
             } else {
-                String formatted = Double.toString(d);
-                if (formatted.endsWith(".0")) {
-                    // Preserve float representation when intentional, or keep clean decimal
-                    sb.append(formatted);
-                } else {
-                    sb.append(formatted);
-                }
+                sb.append(Double.toString(d));
             }
         } else if (value instanceof Map) {
             sb.append('{');
@@ -263,6 +257,9 @@ public final class MiniJson {
             }
         }
 
+        private static final int MAX_DEPTH = 64;
+        private int depth = 0;
+
         Object readValue() {
             skipWhitespace();
             if (pos >= len) {
@@ -290,66 +287,80 @@ public final class MiniJson {
         }
 
         Map<String, Object> readObject() {
-            Map<String, Object> map = new LinkedHashMap<String, Object>();
-            pos++; // consume '{'
-            skipWhitespace();
-            if (pos < len && src.charAt(pos) == '}') {
-                pos++;
-                return map;
+            if (++depth > MAX_DEPTH) {
+                throw new IllegalArgumentException("JSON nesting depth exceeds " + MAX_DEPTH);
             }
-            while (true) {
+            try {
+                Map<String, Object> map = new LinkedHashMap<String, Object>();
+                pos++; // consume '{'
                 skipWhitespace();
-                if (pos >= len || src.charAt(pos) != '"') {
-                    throw new IllegalArgumentException("Expected string key at index " + pos);
-                }
-                String key = readString();
-                skipWhitespace();
-                if (pos >= len || src.charAt(pos) != ':') {
-                    throw new IllegalArgumentException("Expected ':' after key at index " + pos);
-                }
-                pos++; // consume ':'
-                Object value = readValue();
-                map.put(key, value);
-                skipWhitespace();
-                if (pos >= len) {
-                    throw new IllegalArgumentException("Unterminated object");
-                }
-                char next = src.charAt(pos);
-                if (next == '}') {
+                if (pos < len && src.charAt(pos) == '}') {
                     pos++;
                     return map;
-                } else if (next == ',') {
-                    pos++;
-                } else {
-                    throw new IllegalArgumentException("Expected ',' or '}' at index " + pos);
                 }
+                while (true) {
+                    skipWhitespace();
+                    if (pos >= len || src.charAt(pos) != '"') {
+                        throw new IllegalArgumentException("Expected string key at index " + pos);
+                    }
+                    String key = readString();
+                    skipWhitespace();
+                    if (pos >= len || src.charAt(pos) != ':') {
+                        throw new IllegalArgumentException("Expected ':' after key at index " + pos);
+                    }
+                    pos++; // consume ':'
+                    Object value = readValue();
+                    map.put(key, value);
+                    skipWhitespace();
+                    if (pos >= len) {
+                        throw new IllegalArgumentException("Unterminated object");
+                    }
+                    char next = src.charAt(pos);
+                    if (next == '}') {
+                        pos++;
+                        return map;
+                    } else if (next == ',') {
+                        pos++;
+                    } else {
+                        throw new IllegalArgumentException("Expected ',' or '}' at index " + pos);
+                    }
+                }
+            } finally {
+                depth--;
             }
         }
 
         List<Object> readArray() {
-            List<Object> list = new ArrayList<Object>();
-            pos++; // consume '['
-            skipWhitespace();
-            if (pos < len && src.charAt(pos) == ']') {
-                pos++;
-                return list;
+            if (++depth > MAX_DEPTH) {
+                throw new IllegalArgumentException("JSON nesting depth exceeds " + MAX_DEPTH);
             }
-            while (true) {
-                Object value = readValue();
-                list.add(value);
+            try {
+                List<Object> list = new ArrayList<Object>();
+                pos++; // consume '['
                 skipWhitespace();
-                if (pos >= len) {
-                    throw new IllegalArgumentException("Unterminated array");
-                }
-                char next = src.charAt(pos);
-                if (next == ']') {
+                if (pos < len && src.charAt(pos) == ']') {
                     pos++;
                     return list;
-                } else if (next == ',') {
-                    pos++;
-                } else {
-                    throw new IllegalArgumentException("Expected ',' or ']' at index " + pos);
                 }
+                while (true) {
+                    Object value = readValue();
+                    list.add(value);
+                    skipWhitespace();
+                    if (pos >= len) {
+                        throw new IllegalArgumentException("Unterminated array");
+                    }
+                    char next = src.charAt(pos);
+                    if (next == ']') {
+                        pos++;
+                        return list;
+                    } else if (next == ',') {
+                        pos++;
+                    } else {
+                        throw new IllegalArgumentException("Expected ',' or ']' at index " + pos);
+                    }
+                }
+            } finally {
+                depth--;
             }
         }
 

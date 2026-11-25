@@ -40,6 +40,8 @@ public final class StandByOverlayView extends FrameLayout {
     private final TextView tvState;
     private final TextView tvMusicTitle;
     private final LinearLayout musicBar;
+    private final android.widget.ImageView btnPlayPause;
+    private boolean lastMusicPlayingRendered = true;
     private final ParticleOrbView orbView;
     private final TextView tvExit;
     private final FrameLayout.LayoutParams exitLp;
@@ -123,13 +125,14 @@ public final class StandByOverlayView extends FrameLayout {
         mtLp.rightMargin = UiTheme.dp(context, 14);
         musicBar.addView(tvMusicTitle, mtLp);
 
-        musicBar.addView(UiTheme.circleIconButton(context, Icons.Name.PAUSE, UiTheme.TEXT_PRIMARY, UiTheme.BG_ELEVATED, 44,
+        btnPlayPause = UiTheme.circleIconButton(context, Icons.Name.PAUSE, UiTheme.TEXT_PRIMARY, UiTheme.BG_ELEVATED, 44,
                 new OnClickListener() {
                     @Override
                     public void onClick(View v) {
                         if (callback != null) callback.onMediaTogglePause();
                     }
-                }));
+                });
+        musicBar.addView(btnPlayPause);
         View spacer = new View(context);
         musicBar.addView(spacer, new LinearLayout.LayoutParams(UiTheme.dp(context, 8), 1));
         musicBar.addView(UiTheme.circleIconButton(context, Icons.Name.SKIP_NEXT, UiTheme.TEXT_PRIMARY, UiTheme.BG_ELEVATED, 44,
@@ -188,6 +191,19 @@ public final class StandByOverlayView extends FrameLayout {
             String stateLabel,
             boolean musicActive,
             String musicTitle) {
+        update(lang, connected, muted, assistantState, rmsDbfs, stateLabel, musicActive, false, musicTitle);
+    }
+
+    public void update(
+            String lang,
+            boolean connected,
+            boolean muted,
+            String assistantState,
+            double rmsDbfs,
+            String stateLabel,
+            boolean musicActive,
+            boolean musicPaused,
+            String musicTitle) {
         long curMinute = System.currentTimeMillis() / 60_000L;
         if (curMinute != lastRenderedMinute || !lang.equals(lastLang)) {
             lastRenderedMinute = curMinute;
@@ -202,7 +218,15 @@ public final class StandByOverlayView extends FrameLayout {
         }
         orbView.updateState(connected, muted, assistantState, musicActive, rmsDbfs);
 
-        if (musicActive && musicTitle != null && !musicTitle.isEmpty()) {
+        boolean showBar = (musicActive || musicPaused) && musicTitle != null && !musicTitle.isEmpty();
+        if (showBar) {
+            if (musicActive != lastMusicPlayingRendered) {
+                lastMusicPlayingRendered = musicActive;
+                btnPlayPause.setImageDrawable(Icons.of(
+                        musicActive ? Icons.Name.PAUSE : Icons.Name.PLAY,
+                        UiTheme.TEXT_PRIMARY,
+                        UiTheme.dp(getContext(), 20)));
+            }
             if (!musicTitle.equals(tvMusicTitle.getText().toString())) {
                 tvMusicTitle.setText(musicTitle);
             }

@@ -8,30 +8,20 @@ import android.net.Uri;
 import android.os.Build;
 import android.widget.Toast;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.Proxy;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
-
-import homes.mymate.gateway.protocol.MiniJson;
+import homes.mymate.gateway.protocol.ReleaseUpdater;
 
 /**
- * Lightweight In-App Update Checker querying {@code version.json} on the configured Home Mate
- * APK distribution host (e.g. {@code http://<coreHost>:8931/version.json}).
+ * Lightweight In-App Update Checker backed by {@link ReleaseUpdater}.
  *
- * v2.0 hardening:
- * - Uses {@link Proxy#NO_PROXY} for LAN & Tailscale private hosts.
- * - Resolves relative {@code apk_url} (e.g. {@code "hm.apk"}) against the responding base URL.
- * - Guards {@link #openDownloadInBrowser} against {@link ActivityNotFoundException} on headless /
- *   86 wall panel ROMs without a browser.
+ * Defaults to public GitHub Releases ({@link ReleaseUpdater#DEFAULT_GITHUB_RELEASES_API}) so
+ * external releases never point at a private LAN IP or dev port, while retaining full support
+ * for optional custom {@code version.json} LAN/NAS mirrors.
  */
 public final class AppUpdater {
 
     public static final class UpdateInfo {
         public final boolean available;
+        public final boolean noReleaseYet;
         public final int currentVersionCode;
         public final int latestVersionCode;
         public final String latestVersionName;
@@ -41,6 +31,7 @@ public final class AppUpdater {
 
         public UpdateInfo(
                 boolean available,
+                boolean noReleaseYet,
                 int currentVersionCode,
                 int latestVersionCode,
                 String latestVersionName,
@@ -48,12 +39,25 @@ public final class AppUpdater {
                 String notes,
                 String error) {
             this.available = available;
+            this.noReleaseYet = noReleaseYet;
             this.currentVersionCode = currentVersionCode;
             this.latestVersionCode = latestVersionCode;
             this.latestVersionName = latestVersionName;
             this.downloadUrl = downloadUrl;
             this.notes = notes;
             this.error = error;
+        }
+
+        static UpdateInfo from(ReleaseUpdater.UpdateResult r) {
+            return new UpdateInfo(
+                    r.available,
+                    r.noReleaseYet,
+                    r.currentVersionCode,
+                    r.latestVersionCode,
+                    r.latestVersionName,
+                    r.downloadUrl,
+                    r.notes,
+                    r.error);
         }
     }
 
@@ -86,12 +90,27 @@ public final class AppUpdater {
         }
     }
 
-    public static void checkAsync(final Context context, final String baseUrlOrHost, final Callback callback) {
+    private static boolean devicePrefersArm64() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && Build.SUPPORTED_ABIS != null) {
+            for (String abi : Build.SUPPORTED_ABIS) {
+                if ("arm64-v8a".equalsIgnoreCase(abi)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+
+    public static void checkAsync(final Context context, final String updateUrl, final Callback callback) {
         final int curCode = getCurrentVersionCode(context);
+        final String curName = getCurrentVersionName(context);
+        final boolean arm64 = devicePrefersArm64();
         new Thread(new Runnable() {
             @Override
             public void run() {
-                UpdateInfo result = checkSync(curCode, baseUrlOrHost);
+                UpdateInfo result = UpdateInfo.from(
+                        ReleaseUpdater.checkSync(curCode, curName, updateUrl, arm64));
                 if (callback != null) {
                     callback.onResult(result);
                 }
@@ -99,103 +118,41 @@ public final class AppUpdater {
         }, "hm-app-updater").start();
     }
 
-    public static UpdateInfo checkSync(int currentVersionCode, String baseUrlOrHost) {
-        String baseUrl = normalizeBaseUrl(baseUrlOrHost);
-        if (baseUrl.isEmpty()) {
-            return new UpdateInfo(false, currentVersionCode, currentVersionCode, "", "", "", "No Core configured");
-        }
-        String urlStr = baseUrl + "/version.json";
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(urlStr);
-            conn = (HttpURLConnection) (isPrivateHost(url.getHost())
-                    ? url.openConnection(Proxy.NO_PROXY)
-                    : url.openConnection());
-            conn.setConnectTimeout(3000);
-            conn.setReadTimeout(3000);
-            int code = conn.getResponseCode();
-            if (code != 200) {
-                return new UpdateInfo(false, currentVersionCode, currentVersionCode, "", "", "", "HTTP " + code);
-            }
-            StringBuilder sb = new StringBuilder();
-            try (BufferedReader br = new BufferedReader(
-                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    sb.append(line);
-                }
-            }
-            Map<String, Object> obj = MiniJson.parseObject(sb.toString());
-            int latestCode = (int) MiniJson.getLong(obj, "version_code", currentVersionCode);
-            String latestName = MiniJson.getString(obj, "version_name", "2.0.0");
-            String rawApkUrl = MiniJson.getString(obj, "apk_url", "hm.apk");
-            String resolvedApkUrl = resolveApkUrl(baseUrl, rawApkUrl);
-            String notes = MiniJson.getString(obj, "notes", "");
-            return new UpdateInfo(
-                    latestCode > currentVersionCode,
-                    currentVersionCode,
-                    latestCode,
-                    latestName,
-                    resolvedApkUrl,
-                    notes,
-                    null);
-        } catch (Throwable t) {
-            return new UpdateInfo(false, currentVersionCode, currentVersionCode, "", "", "", t.getMessage());
-        } finally {
-            if (conn != null) {
-                conn.disconnect();
-            }
-        }
+    public static UpdateInfo checkSync(int currentVersionCode, String updateUrl) {
+        return UpdateInfo.from(ReleaseUpdater.checkSync(currentVersionCode, "", updateUrl, true));
     }
 
     public static String normalizeBaseUrl(String baseUrlOrHost) {
-        String s = baseUrlOrHost != null ? baseUrlOrHost.trim() : "";
-        if (s.isEmpty()) {
-            return "";
-        }
-        while (s.endsWith("/")) {
-            s = s.substring(0, s.length() - 1);
-        }
-        if (s.startsWith("http://") || s.startsWith("https://")) {
-            return s;
-        }
-        return "http://" + s + ":8931";
+        return ReleaseUpdater.normalizeBaseUrl(baseUrlOrHost);
     }
 
     public static String resolveApkUrl(String baseUrl, String rawApkUrl) {
-        String raw = rawApkUrl != null ? rawApkUrl.trim() : "";
-        if (raw.isEmpty()) {
-            return baseUrl + "/hm.apk";
-        }
-        if (raw.startsWith("http://") || raw.startsWith("https://")) {
-            return raw;
-        }
-        if (raw.startsWith("/")) {
-            return baseUrl + raw;
-        }
-        return baseUrl + "/" + raw;
-    }
-
-    private static boolean isPrivateHost(String host) {
-        if (host == null) {
-            return false;
-        }
-        return host.startsWith("192.168.") || host.startsWith("10.")
-                || host.startsWith("100.") || host.startsWith("172.")
-                || "127.0.0.1".equals(host) || "localhost".equalsIgnoreCase(host);
+        return ReleaseUpdater.resolveApkUrl(baseUrl, rawApkUrl);
     }
 
     public static void openDownloadInBrowser(Context context, String downloadUrl) {
-        if (downloadUrl == null || downloadUrl.trim().isEmpty()) {
+        if (context == null || downloadUrl == null) {
+            return;
+        }
+        String trimmed = downloadUrl.trim();
+        if (trimmed.isEmpty() || !ReleaseUpdater.isHttpUrl(trimmed)) {
+            return;
+        }
+        Uri uri = Uri.parse(trimmed);
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        if (scheme == null
+                || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))
+                || host == null || host.trim().isEmpty()) {
             return;
         }
         try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl.trim()));
+            Intent intent = new Intent(Intent.ACTION_VIEW, uri);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             context.startActivity(intent);
         } catch (ActivityNotFoundException e) {
             try {
-                Toast.makeText(context, downloadUrl.trim(), Toast.LENGTH_LONG).show();
+                Toast.makeText(context, trimmed, Toast.LENGTH_LONG).show();
             } catch (Throwable ignored) {
             }
         }

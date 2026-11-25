@@ -172,11 +172,16 @@ public final class CoreDiscovery {
             if (!"home_mate_beacon".equalsIgnoreCase(type)) {
                 return null;
             }
-            String host = MiniJson.getString(obj, "host", "");
+            // Security (P0-1): ALWAYS bind UDP discovery strictly to the actual UDP packet
+            // source IP (`senderHost`) — never trust an untrusted JSON `"host"` field, and
+            // accept only RFC1918 / Tailscale CGNAT / loopback senders.
+            String host = senderHost != null ? senderHost.trim() : "";
             if (host.isEmpty()) {
-                host = senderHost != null ? senderHost.trim() : "";
+                return null;
             }
-            if (host.isEmpty()) {
+            if (!isPrivateOrTailscaleIp(host)
+                    && !"127.0.0.1".equals(host)
+                    && !"localhost".equalsIgnoreCase(host)) {
                 return null;
             }
             int webPort = MiniJson.getInt(obj, "web_port", 8930);
@@ -249,54 +254,130 @@ public final class CoreDiscovery {
      * Never opens a raw TCP socket to the voice gateway port (:8932).
      */
     public static DiscoveredCore probeHost(String host, int webPort, int defaultGatewayPort, int timeoutMs) {
+        return probeHost(host, webPort, defaultGatewayPort, timeoutMs, null, null);
+    }
+
+    /**
+     * Identity-verified HTTP probe:
+     * 1. Queries unauthenticated {@code GET /api/v0/auth} FIRST (never transmits {@code Authorization}).
+     * 2. If {@code expectedCoreId} is set and does not match the responder's {@code core_id},
+     *    aborts immediately without ever transmitting {@code bearerToken}.
+     * 3. Only attaches {@code Authorization: Bearer} to {@code /api/v0/status} when {@code expectedCoreId}
+     *    was explicitly verified against {@code /api/v0/auth} (preventing token exfiltration on foreign
+     *    Wi-Fi IP collisions or spoofed LAN hosts).
+     */
+    public static DiscoveredCore probeHost(
+            String host,
+            int webPort,
+            int defaultGatewayPort,
+            int timeoutMs,
+            String bearerToken,
+            String expectedCoreId) {
+        if (host == null || host.trim().isEmpty()) {
+            return null;
+        }
+        String expectedId = expectedCoreId != null ? expectedCoreId.trim() : "";
+        String cleanToken = bearerToken != null ? bearerToken.trim() : "";
         long startNs = System.nanoTime();
+
+        // Step 1: Unauthenticated identity preflight via GET /api/v0/auth
+        String authCoreId = "";
+        boolean authPaired = false;
+        boolean authLanExempt = false;
+        boolean authVoiceOpen = false;
+        int authGwPort = defaultGatewayPort;
+        String authRoomName = "";
+        String authAssistantName = "Home Mate";
+        boolean authOk = false;
+        boolean authHttpResponded = false;
+
+        HttpURLConnection authConn = null;
+        try {
+            URL authUrl = new URL("http://" + host + ":" + webPort + "/api/v0/auth");
+            authConn = (HttpURLConnection) authUrl.openConnection(Proxy.NO_PROXY);
+            authConn.setConnectTimeout(timeoutMs);
+            authConn.setReadTimeout(timeoutMs);
+            authConn.setRequestMethod("GET");
+            authConn.setInstanceFollowRedirects(false);
+            authConn.setUseCaches(false);
+            int authCode = authConn.getResponseCode();
+            authHttpResponded = (authCode > 0);
+            if (authCode == 200) {
+                String authBody = readBody(authConn);
+                if (authBody.contains("configured") && authBody.trim().startsWith("{")) {
+                    Map<String, Object> authObj = MiniJson.parseObject(authBody);
+                    authCoreId = MiniJson.getString(authObj, "core_id", "").trim();
+                    authPaired = MiniJson.getBoolean(authObj, "configured", false);
+                    authLanExempt = MiniJson.getBoolean(authObj, "lan_gateway_exempt", false);
+                    authVoiceOpen = MiniJson.getBoolean(authObj, "voice_gateway_open", false);
+                    authGwPort = MiniJson.getInt(authObj, "gateway_port", defaultGatewayPort);
+                    authRoomName = MiniJson.getString(authObj, "room_name", "");
+                    authAssistantName = MiniJson.getString(authObj, "assistant_name", "Home Mate");
+                    authOk = true;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Transport-level failure (SocketTimeoutException, ConnectException,
+            // NoRouteToHostException, IOException): authHttpResponded stays false.
+        } finally {
+            if (authConn != null) {
+                authConn.disconnect();
+            }
+        }
+
+        // Fast-fail on transport-level unreachable/dead IP: do not waste a second full timeout
+        // attempting /api/v0/status when /api/v0/auth never received an HTTP response.
+        if (!authHttpResponded) {
+            return null;
+        }
+
+        boolean coreIdVerified = !expectedId.isEmpty()
+                && !authCoreId.isEmpty()
+                && authCoreId.equalsIgnoreCase(expectedId);
+        if (!expectedId.isEmpty() && !coreIdVerified) {
+            // Identity mismatch (or non-Home-Mate host at same RFC1918 IP): refuse without sending token.
+            return null;
+        }
+        // Only send a saved Bearer token after verifying core_id matches expectedCoreId.
+        String tokenToSend = (coreIdVerified && !cleanToken.isEmpty()) ? cleanToken : "";
+        if (authOk && authPaired && !authLanExempt && tokenToSend.isEmpty()) {
+            long rttMs = Math.max(1L, (System.nanoTime() - startNs) / 1_000_000L);
+            return new DiscoveredCore(
+                    host, webPort, authGwPort,
+                    authAssistantName, "", rttMs,
+                    true, authVoiceOpen, authRoomName, authCoreId, authLanExempt, null);
+        }
+
+        // Step 2: Query /api/v0/status (unauthenticated unless core_id matched expectedCoreId)
+        HttpURLConnection conn = null;
         try {
             URL url = new URL("http://" + host + ":" + webPort + "/api/v0/status");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+            conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
             conn.setConnectTimeout(timeoutMs);
             conn.setReadTimeout(timeoutMs);
             conn.setRequestMethod("GET");
+            conn.setInstanceFollowRedirects(false);
             conn.setUseCaches(false);
+            if (!tokenToSend.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + tokenToSend);
+            }
             int code = conn.getResponseCode();
             long rttMs = Math.max(1L, (System.nanoTime() - startNs) / 1_000_000L);
 
-            if (code == 401) {
-                // Paired Home Mate Core! Query auth-exempt /api/v0/auth for core_id, lan_gateway_exempt & voice_gateway_open
-                conn.disconnect();
-                URL authUrl = new URL("http://" + host + ":" + webPort + "/api/v0/auth");
-                HttpURLConnection authConn = (HttpURLConnection) authUrl.openConnection(Proxy.NO_PROXY);
-                authConn.setConnectTimeout(timeoutMs);
-                authConn.setReadTimeout(timeoutMs);
-                authConn.setRequestMethod("GET");
-                try {
-                    if (authConn.getResponseCode() == 200) {
-                        String body = readBody(authConn);
-                        if (body.contains("configured")) {
-                            Map<String, Object> authObj = MiniJson.parseObject(body);
-                            String coreId = MiniJson.getString(authObj, "core_id", "");
-                            boolean lanExempt = MiniJson.getBoolean(authObj, "lan_gateway_exempt", false);
-                            boolean voiceOpen = MiniJson.getBoolean(authObj, "voice_gateway_open", false);
-                            int gwPort = MiniJson.getInt(authObj, "gateway_port", defaultGatewayPort);
-                            String roomName = MiniJson.getString(authObj, "room_name", "");
-                            String assistantName = MiniJson.getString(authObj, "assistant_name", "Home Mate");
-                            return new DiscoveredCore(
-                                    host, webPort, gwPort,
-                                    assistantName, "", rttMs,
-                                    true, voiceOpen, roomName, coreId, lanExempt, null);
-                        }
-                    }
-                } finally {
-                    authConn.disconnect();
+            if (code == 401 || code == 403) {
+                if (authOk) {
+                    return new DiscoveredCore(
+                            host, webPort, authGwPort,
+                            authAssistantName, "", rttMs,
+                            true, authVoiceOpen, authRoomName, authCoreId, authLanExempt, null);
                 }
                 return null;
             }
             if (code != 200) {
-                conn.disconnect();
                 return null;
             }
 
             String body = readBody(conn);
-            conn.disconnect();
             if (body.isEmpty() || !body.trim().startsWith("{")) {
                 return null;
             }
@@ -308,14 +389,20 @@ public final class CoreDiscovery {
             }
             String version = MiniJson.getString(obj, "version", "");
             String roomName = MiniJson.getString(obj, "room_name", "");
-            String coreId = MiniJson.getString(obj, "core_id", "");
+            String coreId = MiniJson.getString(obj, "core_id", "").trim();
+            if (coreId.isEmpty()) {
+                coreId = authCoreId;
+            }
+            if (!expectedId.isEmpty() && !coreId.equalsIgnoreCase(expectedId)) {
+                return null;
+            }
             Map<String, Object> authObj = MiniJson.getObject(obj, "auth");
-            boolean paired = authObj != null && MiniJson.getBoolean(authObj, "configured", false);
-            boolean lanExempt = authObj != null && MiniJson.getBoolean(authObj, "lan_gateway_exempt", false);
+            boolean paired = authObj != null && MiniJson.getBoolean(authObj, "configured", authPaired);
+            boolean lanExempt = authObj != null && MiniJson.getBoolean(authObj, "lan_gateway_exempt", authLanExempt);
             int gwPort = resolveGatewayPort(host, obj, defaultGatewayPort, 0);
             boolean voiceOpen = inferVoiceGatewayOpenFromStatus(host, obj);
-            // If paired AND lanExempt allowed /api/v0/status to return 200, authRequired is false for this LAN peer!
-            boolean authRequiredForPeer = paired && !lanExempt;
+            boolean hasToken = !tokenToSend.isEmpty();
+            boolean authRequiredForPeer = paired && !lanExempt && !hasToken;
             return new DiscoveredCore(
                     host,
                     webPort,
@@ -331,6 +418,10 @@ public final class CoreDiscovery {
                     null);
         } catch (Throwable ignored) {
             return null;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
     }
 
@@ -464,12 +555,10 @@ public final class CoreDiscovery {
                 if (coreId.isEmpty() && !other.coreId.isEmpty()) coreId = other.coreId;
                 voiceOpen = voiceOpen || other.voiceGatewayOpen;
                 lanExempt = lanExempt || other.lanGatewayExempt;
-                // If any route to this Core succeeded without auth (e.g. LAN exemption), don't force 401
+                // If any route to this Core succeeded without auth (HTTP 200), clear authRequired.
+                // Never override an actual 401 solely from lanExempt (e.g. Tailscale or stale token).
                 authRequired = authRequired && other.authRequired;
                 bestRtt = Math.min(bestRtt, other.rttMs);
-            }
-            if (lanExempt && isPrivateOrTailscaleIp(primary.host)) {
-                authRequired = false;
             }
             merged.add(new DiscoveredCore(
                     primary.host, webPort, gwPort, assistant, version, bestRtt,
@@ -564,6 +653,157 @@ public final class CoreDiscovery {
         return scanLan(preferredHost, null, webPort, defaultGatewayPort, timeoutMs);
     }
 
+    /**
+     * Backward-compatible overload; unauthenticated LAN scans NEVER transmit saved Bearer tokens
+     * (P0-1 fail-closed), so any {@code tokensByHost} argument is ignored.
+     */
+    public static List<DiscoveredCore> scanLan(
+            String preferredHost,
+            List<String> extraCandidateHosts,
+            Map<String, String> ignoredTokensByHost,
+            int webPort,
+            int defaultGatewayPort,
+            int timeoutMs) {
+        return scanLan(preferredHost, extraCandidateHosts, webPort, defaultGatewayPort, timeoutMs);
+    }
+
+    /**
+     * Queries a discovered Core's {@code GET /api/v0/fleet} endpoint to discover sibling household
+     * Cores (enabling full-house discovery even over Tailscale when LAN broadcasts cannot traverse
+     * routed subnets). Only accepts RFC1918 or Tailscale peer IPs (or loopback when the seed itself
+     * is loopback in local tests) to prevent SSRF toward public internet addresses.
+     */
+    public static List<String[]> fetchFleetPeerEndpoints(
+            String host, int webPort, String ignoredBearerToken, int timeoutMs) {
+        return fetchFleetPeerEndpoints(host, webPort, timeoutMs);
+    }
+
+    public static List<String[]> fetchFleetPeerEndpoints(String host, int webPort, int timeoutMs) {
+        List<String[]> peers = new ArrayList<String[]>();
+        if (host == null || host.trim().isEmpty()) {
+            return peers;
+        }
+        String cleanHost = host.trim();
+        boolean seedIsLoopback = "127.0.0.1".equals(cleanHost) || "localhost".equalsIgnoreCase(cleanHost);
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL("http://" + cleanHost + ":" + webPort + "/api/v0/fleet");
+            conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+            int effTimeout = Math.max(timeoutMs, 1500);
+            conn.setConnectTimeout(effTimeout);
+            conn.setReadTimeout(effTimeout);
+            conn.setRequestMethod("GET");
+            conn.setInstanceFollowRedirects(false);
+            conn.setUseCaches(false);
+            // Security (P0-1): discovery fleet expansion MUST remain unauthenticated so an
+            // unverified LAN host can never capture saved Bearer credentials.
+            if (conn.getResponseCode() != 200) {
+                return peers;
+            }
+            String body = readBody(conn);
+            if (body.isEmpty() || !body.trim().startsWith("{")) {
+                return peers;
+            }
+            Map<String, Object> obj = MiniJson.parseObject(body);
+            List<Object> nodes = MiniJson.getArray(obj, "nodes");
+            if (nodes == null) {
+                return peers;
+            }
+            Set<String> seen = new LinkedHashSet<String>();
+            for (Object item : nodes) {
+                if (!(item instanceof Map)) {
+                    continue;
+                }
+                @SuppressWarnings("unchecked")
+                Map<String, Object> node = (Map<String, Object>) item;
+                String baseUrl = MiniJson.getString(node, "base_url", "").trim();
+                if (baseUrl.isEmpty()) {
+                    continue;
+                }
+                try {
+                    URL peerUrl = new URL(baseUrl);
+                    String peerHost = peerUrl.getHost() != null ? peerUrl.getHost().trim() : "";
+                    int peerPort = peerUrl.getPort() > 0 ? peerUrl.getPort() : 8930;
+                    boolean allowed = isPrivateOrTailscaleIp(peerHost)
+                            || (seedIsLoopback && ("127.0.0.1".equals(peerHost) || "localhost".equalsIgnoreCase(peerHost)));
+                    if (!allowed) {
+                        continue;
+                    }
+                    String key = peerHost.toLowerCase(java.util.Locale.US) + ":" + peerPort;
+                    if (seen.add(key)) {
+                        peers.add(new String[]{peerHost, String.valueOf(peerPort)});
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+        return peers;
+    }
+
+    /**
+     * Probes explicit saved/preferred hosts with a Tailscale/DERP-friendly timeout and expands
+     * reachable household peers via bounded 2-hop unauthenticated {@code /api/v0/fleet}.
+     * Security (P0-1): strictly unauthenticated — never transmits saved Bearer tokens.
+     */
+    public static List<DiscoveredCore> probeSavedHostsWithFleetFallback(
+            List<String> candidateHosts,
+            int webPort,
+            int defaultGatewayPort,
+            int timeoutMs) {
+        Set<String> explicitCandidates = new LinkedHashSet<String>();
+        if (candidateHosts != null) {
+            for (String h : candidateHosts) {
+                if (h != null && !h.trim().isEmpty()) {
+                    explicitCandidates.add(h.trim());
+                }
+            }
+        }
+        if (explicitCandidates.isEmpty()) {
+            return Collections.emptyList();
+        }
+        final int effectiveTimeoutMs = Math.max(timeoutMs, 4500);
+        List<DiscoveredCore> raw = new ArrayList<DiscoveredCore>();
+        Set<String> probedEndpoints = new LinkedHashSet<String>();
+
+        int poolSize = Math.min(12, explicitCandidates.size());
+        ExecutorService pool = Executors.newFixedThreadPool(poolSize);
+        try {
+            List<Future<DiscoveredCore>> futures = new ArrayList<Future<DiscoveredCore>>(explicitCandidates.size());
+            for (final String ip : explicitCandidates) {
+                probedEndpoints.add(ip.toLowerCase(java.util.Locale.US) + ":" + webPort);
+                futures.add(pool.submit(new Callable<DiscoveredCore>() {
+                    @Override
+                    public DiscoveredCore call() {
+                        return probeHost(ip, webPort, defaultGatewayPort, effectiveTimeoutMs);
+                    }
+                }));
+            }
+            int batches = (explicitCandidates.size() + poolSize - 1) / poolSize;
+            long deadlineMs = System.currentTimeMillis()
+                    + Math.min(20_000L, batches * (long) effectiveTimeoutMs + 2500L);
+            for (Future<DiscoveredCore> f : futures) {
+                long remainingMs = Math.max(1L, deadlineMs - System.currentTimeMillis());
+                try {
+                    DiscoveredCore c = f.get(remainingMs, TimeUnit.MILLISECONDS);
+                    if (c != null) {
+                        raw.add(c);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+
+        expandFleetPeers(raw, probedEndpoints, defaultGatewayPort, effectiveTimeoutMs);
+        return deduplicateByCoreId(raw);
+    }
+
     public static List<DiscoveredCore> scanLan(
             String preferredHost,
             List<String> extraCandidateHosts,
@@ -571,55 +811,186 @@ public final class CoreDiscovery {
             int defaultGatewayPort,
             int timeoutMs) {
         List<DiscoveredCore> raw = new ArrayList<DiscoveredCore>();
+        int udpListenMs = Math.max(300, Math.min(500, timeoutMs));
+        final int remoteTimeoutMs = Math.max(timeoutMs, 3000);
+        final int lanTimeoutMs = Math.max(timeoutMs, 450);
 
         // 1. Instant UDP beacon discovery (for hm-core builds supporting UDP 8933 active beacons)
-        raw.addAll(discoverViaUdpBeacon(240));
+        raw.addAll(discoverViaUdpBeacon(udpListenMs));
 
-        // 2. Active RFC1918 subnet HTTP probe + saved/preferred candidate hosts (e.g. Tailscale)
-        Set<String> candidates = new LinkedHashSet<String>();
+        // 2. Explicit saved/preferred candidates on a dedicated pool (never queued behind 254 LAN IPs)
+        //    running concurrently with a 48-thread RFC1918 LAN sweep.
+        Set<String> explicitCandidates = new LinkedHashSet<String>();
         if (preferredHost != null && !preferredHost.trim().isEmpty()) {
-            candidates.add(preferredHost.trim());
+            explicitCandidates.add(preferredHost.trim());
         }
         if (extraCandidateHosts != null) {
             for (String h : extraCandidateHosts) {
                 if (h != null && !h.trim().isEmpty()) {
-                    candidates.add(h.trim());
+                    explicitCandidates.add(h.trim());
                 }
             }
         }
 
+        Set<String> lanSweepCandidates = new LinkedHashSet<String>();
         List<String> prefixes = detectRfc1918LanPrefixes();
         for (String prefix : prefixes) {
             for (int lastOctet = 1; lastOctet <= 254; lastOctet++) {
-                candidates.add(prefix + "." + lastOctet);
-            }
-        }
-
-        if (!candidates.isEmpty()) {
-            ExecutorService pool = Executors.newFixedThreadPool(36);
-            List<Future<DiscoveredCore>> futures = new ArrayList<Future<DiscoveredCore>>(candidates.size());
-            for (final String ip : candidates) {
-                futures.add(pool.submit(new Callable<DiscoveredCore>() {
-                    @Override
-                    public DiscoveredCore call() {
-                        return probeHost(ip, webPort, defaultGatewayPort, timeoutMs);
-                    }
-                }));
-            }
-
-            for (Future<DiscoveredCore> f : futures) {
-                try {
-                    DiscoveredCore c = f.get(timeoutMs + 900L, TimeUnit.MILLISECONDS);
-                    if (c != null) {
-                        raw.add(c);
-                    }
-                } catch (Throwable ignored) {
+                String ip = prefix + "." + lastOctet;
+                if (!explicitCandidates.contains(ip)) {
+                    lanSweepCandidates.add(ip);
                 }
             }
-            pool.shutdownNow();
         }
 
+        Set<String> probedEndpoints = new LinkedHashSet<String>();
+        for (DiscoveredCore c : raw) {
+            probedEndpoints.add(c.host.toLowerCase(java.util.Locale.US) + ":" + c.webPort);
+        }
+
+        ExecutorService explicitPool = null;
+        ExecutorService lanPool = null;
+        try {
+            long sweepStartMs = System.currentTimeMillis();
+            List<Future<DiscoveredCore>> explicitFutures = new ArrayList<Future<DiscoveredCore>>(explicitCandidates.size());
+            int explicitThreads = 0;
+            if (!explicitCandidates.isEmpty()) {
+                explicitThreads = Math.min(12, explicitCandidates.size());
+                explicitPool = Executors.newFixedThreadPool(explicitThreads);
+                for (final String ip : explicitCandidates) {
+                    probedEndpoints.add(ip.toLowerCase(java.util.Locale.US) + ":" + webPort);
+                    explicitFutures.add(explicitPool.submit(new Callable<DiscoveredCore>() {
+                        @Override
+                        public DiscoveredCore call() {
+                            return probeHost(ip, webPort, defaultGatewayPort, remoteTimeoutMs);
+                        }
+                    }));
+                }
+            }
+
+            List<Future<DiscoveredCore>> lanFutures = new ArrayList<Future<DiscoveredCore>>(lanSweepCandidates.size());
+            int lanThreads = 0;
+            if (!lanSweepCandidates.isEmpty()) {
+                lanThreads = Math.min(48, lanSweepCandidates.size());
+                lanPool = Executors.newFixedThreadPool(lanThreads);
+                for (final String ip : lanSweepCandidates) {
+                    probedEndpoints.add(ip.toLowerCase(java.util.Locale.US) + ":" + webPort);
+                    lanFutures.add(lanPool.submit(new Callable<DiscoveredCore>() {
+                        @Override
+                        public DiscoveredCore call() {
+                            return probeHost(ip, webPort, defaultGatewayPort, lanTimeoutMs);
+                        }
+                    }));
+                }
+            }
+
+            if (!explicitFutures.isEmpty()) {
+                int explicitBatches = (explicitCandidates.size() + explicitThreads - 1) / explicitThreads;
+                long explicitDeadlineMs = sweepStartMs
+                        + Math.min(15_000L, explicitBatches * (long) remoteTimeoutMs + 2500L);
+                for (Future<DiscoveredCore> f : explicitFutures) {
+                    long remainingMs = Math.max(1L, explicitDeadlineMs - System.currentTimeMillis());
+                    try {
+                        DiscoveredCore c = f.get(remainingMs, TimeUnit.MILLISECONDS);
+                        if (c != null) {
+                            raw.add(c);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+
+            if (!lanFutures.isEmpty()) {
+                int lanBatches = (lanSweepCandidates.size() + lanThreads - 1) / lanThreads;
+                long lanDeadlineMs = sweepStartMs
+                        + Math.min(12_000L, lanBatches * (long) lanTimeoutMs + 2000L);
+                for (Future<DiscoveredCore> f : lanFutures) {
+                    long remainingMs = Math.max(1L, lanDeadlineMs - System.currentTimeMillis());
+                    try {
+                        DiscoveredCore c = f.get(remainingMs, TimeUnit.MILLISECONDS);
+                        if (c != null) {
+                            raw.add(c);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } finally {
+            if (explicitPool != null) {
+                explicitPool.shutdownNow();
+            }
+            if (lanPool != null) {
+                lanPool.shutdownNow();
+            }
+        }
+
+        // 3. Bounded 2-hop /api/v0/fleet peer expansion (max 32 peers) so remote Tailscale users
+        //    who reach ANY single home Core automatically discover the entire household fleet.
+        expandFleetPeers(raw, probedEndpoints, defaultGatewayPort, remoteTimeoutMs);
         return deduplicateByCoreId(raw);
+    }
+
+    private static void expandFleetPeers(
+            List<DiscoveredCore> raw,
+            Set<String> probedEndpoints,
+            final int defaultGatewayPort,
+            final int remoteTimeoutMs) {
+        Set<String> fleetQueried = new LinkedHashSet<String>();
+        int totalExpanded = 0;
+        for (int hop = 0; hop < 2 && totalExpanded < 32; hop++) {
+            List<DiscoveredCore> seeds = new ArrayList<DiscoveredCore>(raw);
+            List<String[]> nextTargets = new ArrayList<String[]>();
+            for (DiscoveredCore seed : seeds) {
+                String seedKey = seed.host.toLowerCase(java.util.Locale.US) + ":" + seed.webPort;
+                if (!fleetQueried.add(seedKey)) {
+                    continue;
+                }
+                List<String[]> peers = fetchFleetPeerEndpoints(seed.host, seed.webPort, remoteTimeoutMs);
+                for (String[] ep : peers) {
+                    if (totalExpanded >= 32) {
+                        break;
+                    }
+                    String epKey = ep[0].toLowerCase(java.util.Locale.US) + ":" + ep[1];
+                    if (probedEndpoints.add(epKey)) {
+                        nextTargets.add(ep);
+                        totalExpanded++;
+                    }
+                }
+            }
+            if (nextTargets.isEmpty()) {
+                break;
+            }
+            int poolSize = Math.min(12, nextTargets.size());
+            ExecutorService pool = Executors.newFixedThreadPool(poolSize);
+            try {
+                List<Future<DiscoveredCore>> futures = new ArrayList<Future<DiscoveredCore>>(nextTargets.size());
+                for (final String[] ep : nextTargets) {
+                    final String pHost = ep[0];
+                    final int pPort = Integer.parseInt(ep[1]);
+                    futures.add(pool.submit(new Callable<DiscoveredCore>() {
+                        @Override
+                        public DiscoveredCore call() {
+                            return probeHost(pHost, pPort, defaultGatewayPort, remoteTimeoutMs);
+                        }
+                    }));
+                }
+                int batches = (nextTargets.size() + poolSize - 1) / poolSize;
+                long deadlineMs = System.currentTimeMillis()
+                        + Math.min(15_000L, batches * (long) remoteTimeoutMs + 1500L);
+                for (Future<DiscoveredCore> f : futures) {
+                    long remainingMs = Math.max(1L, deadlineMs - System.currentTimeMillis());
+                    try {
+                        DiscoveredCore c = f.get(remainingMs, TimeUnit.MILLISECONDS);
+                        if (c != null) {
+                            raw.add(c);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+        }
     }
 
     public static List<String> detectRfc1918LanPrefixes() {
@@ -670,5 +1041,51 @@ public final class CoreDiscovery {
         } catch (Throwable ignored) {
         }
         return sb.toString();
+    }
+
+    /**
+     * Standalone CLI entry point for smoke tests ({@code tools/smoke_with_core.py}) and LAN probing.
+     */
+    public static void main(String[] args) {
+        String probeHostArg = null;
+        int webPort = 8930;
+        int gwPort = 8932;
+        int timeoutMs = 1500;
+        String token = null;
+        String expectedCoreId = null;
+
+        for (int i = 0; i < args.length; i++) {
+            if ("--probe".equals(args[i]) && i + 1 < args.length) {
+                probeHostArg = args[++i];
+            } else if ("--web-port".equals(args[i]) && i + 1 < args.length) {
+                webPort = Integer.parseInt(args[++i]);
+            } else if ("--gw-port".equals(args[i]) && i + 1 < args.length) {
+                gwPort = Integer.parseInt(args[++i]);
+            } else if ("--timeout-ms".equals(args[i]) && i + 1 < args.length) {
+                timeoutMs = Integer.parseInt(args[++i]);
+            } else if ("--token".equals(args[i]) && i + 1 < args.length) {
+                token = args[++i];
+            } else if ("--core-id".equals(args[i]) && i + 1 < args.length) {
+                expectedCoreId = args[++i];
+            }
+        }
+
+        if (probeHostArg != null && !probeHostArg.trim().isEmpty()) {
+            DiscoveredCore found = probeHost(probeHostArg.trim(), webPort, gwPort, timeoutMs, token, expectedCoreId);
+            if (found == null) {
+                System.err.println("NOT_FOUND: " + probeHostArg + ":" + webPort);
+                System.exit(1);
+                return;
+            }
+            System.out.println("DISCOVERED: " + found.toString()
+                    + " [web=" + found.webPort + " gw=" + found.gatewayPort + "]");
+            return;
+        }
+
+        List<DiscoveredCore> cores = scanLan(null, webPort, gwPort, timeoutMs);
+        for (DiscoveredCore c : cores) {
+            System.out.println("DISCOVERED: " + c.toString()
+                    + " [web=" + c.webPort + " gw=" + c.gatewayPort + "]");
+        }
     }
 }
