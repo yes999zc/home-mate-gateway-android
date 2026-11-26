@@ -542,7 +542,7 @@ public final class FinalAuditRemediationTest {
                 "EN settings_sw_aec must say PBFDAF, got: " + enAec);
 
         // Version bump check
-        assertEquals("2.3.15", NorthboundSession.GATEWAY_VERSION, "GATEWAY_VERSION must be 2.3.15");
+        assertEquals("2.3.16", NorthboundSession.GATEWAY_VERSION, "GATEWAY_VERSION must be 2.3.16");
     }
 
     private static CoreApiClient.CoreSnapshot makeSnap(List<CoreApiClient.ChatEntry> transcript) {

@@ -41,7 +41,7 @@ public final class NorthboundSession {
 
     public static final int PROTOCOL_V2 = 2;
     public static final int MIN_PROTOCOL = 0;
-    public static final String GATEWAY_VERSION = "2.3.15";
+    public static final String GATEWAY_VERSION = "2.3.16";
     public static final String GATEWAY_NAME = "home-mate-gateway-android " + GATEWAY_VERSION;
     public static final String PROFILE_VERSION = "android-v2";
     public static final String AUDIO_PROFILE = "android_farfield_v1";
@@ -208,6 +208,41 @@ public final class NorthboundSession {
 
     public void attachLocalKwsEngine(LocalKwsEngine engine) {
         this.localKwsEngine = engine;
+        if (engine == null) {
+            return;
+        }
+        // Read live on-disk kw.txt hash OUTSIDE stateLock to avoid lock-order inversion.
+        String diskHash = engine.getCurrentKeywordsHash();
+        List<String> retreatWordsToSync = null;
+        synchronized (stateLock) {
+            String expectedKwHash = expectedPersistedKwsKeywordsHashLocked();
+            if (!expectedKwHash.isEmpty()) {
+                if (diskHash != null && !diskHash.isEmpty() && !expectedKwHash.equals(diskHash)) {
+                    // Another Core overwrote the shared on-disk kw.txt while we were connected
+                    // elsewhere. Invalidate the restored kws active_hash so Core's reconnect
+                    // reconcile pushes this Core's real word list instead of skipping unchanged.
+                    blockActiveHashes.put("kws", "");
+                    this.kwsLoadedHash = diskHash;
+                } else if (diskHash != null && expectedKwHash.equals(diskHash) && !this.retreatKeywords.isEmpty()) {
+                    retreatWordsToSync = new ArrayList<String>(this.retreatKeywords);
+                }
+            }
+        }
+        if (retreatWordsToSync != null) {
+            engine.setRetreatWords(retreatWordsToSync);
+        }
+    }
+
+    private String expectedPersistedKwsKeywordsHashLocked() {
+        Map<String, Object> kwsBlock = configBlocks.get("kws");
+        if (kwsBlock != null) {
+            String kwTxt = MiniJson.getString(kwsBlock, "keywords",
+                    MiniJson.getString(kwsBlock, "keywords_txt", ""));
+            if (kwTxt != null && !kwTxt.trim().isEmpty()) {
+                return fnv1a64Hex(kwTxt);
+            }
+        }
+        return this.kwsLoadedHash != null ? this.kwsLoadedHash.trim() : "";
     }
 
     public NorthboundSession(
@@ -2147,6 +2182,8 @@ public final class NorthboundSession {
     public void sendConfigState(String requestId) throws IOException {
         Map<String, Object> frame = new LinkedHashMap<String, Object>();
         List<String> caps = getDeviceCapabilities();
+        LocalKwsEngine eng = this.localKwsEngine;
+        String liveDiskKwsHash = (eng != null) ? eng.getCurrentKeywordsHash() : null;
         synchronized (stateLock) {
             frame.put("type", "config_state");
             if (requestId != null && !requestId.trim().isEmpty()) {
@@ -2183,6 +2220,19 @@ public final class NorthboundSession {
                 long gen = blockGenerations.containsKey(blockName) ? blockGenerations.get(blockName).longValue() : 0L;
                 long epoch = blockDataEpochs.containsKey(blockName) ? blockDataEpochs.get(blockName).longValue() : 0L;
                 String opId = blockOperationIds.containsKey(blockName) ? blockOperationIds.get(blockName) : ("boot-" + blockName);
+                String blockStatus = "active";
+
+                if ("kws".equals(blockName) && eng != null) {
+                    String expectedKwHash = expectedPersistedKwsKeywordsHashLocked();
+                    boolean diskMismatch = (!expectedKwHash.isEmpty()
+                            && (liveDiskKwsHash == null || liveDiskKwsHash.isEmpty()
+                                || !expectedKwHash.equals(liveDiskKwsHash)))
+                            || hash.isEmpty();
+                    if (diskMismatch) {
+                        hash = "";
+                        blockStatus = "idle";
+                    }
+                }
 
                 Map<String, Object> blockState = new LinkedHashMap<String, Object>();
                 blockState.put("block", blockName);
@@ -2192,7 +2242,7 @@ public final class NorthboundSession {
                 blockState.put("persisted_hash", hash);
                 blockState.put("active_hash", hash);
                 blockState.put("active_values", values);
-                blockState.put("state", "active");
+                blockState.put("state", blockStatus);
                 blocksList.add(blockState);
             }
             frame.put("blocks", blocksList);

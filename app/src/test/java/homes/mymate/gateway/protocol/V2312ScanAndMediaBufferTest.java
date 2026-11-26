@@ -1082,8 +1082,8 @@ public final class V2312ScanAndMediaBufferTest {
     }
 
     private static void testGatewayVersion2315() {
-        assertEquals("2.3.15", NorthboundSession.GATEWAY_VERSION, "GATEWAY_VERSION must be 2.3.15");
-        assertTrue(NorthboundSession.GATEWAY_NAME.contains("2.3.15"), "GATEWAY_NAME must include 2.3.15");
+        assertEquals("2.3.16", NorthboundSession.GATEWAY_VERSION, "GATEWAY_VERSION must be 2.3.16");
+        assertTrue(NorthboundSession.GATEWAY_NAME.contains("2.3.16"), "GATEWAY_NAME must include 2.3.16");
     }
 
     private static void assertTrue(boolean cond, String msg) {

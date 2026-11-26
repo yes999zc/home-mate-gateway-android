@@ -56,7 +56,8 @@ public final class NorthboundSessionTest {
         testWave4PrerollOrderDynamicSizingAndWireContracts();
         testWave5UplinkGateSerializationActiveStatesEchoHealthAndFocusLoss();
         testV239SpeakingToListeningFlushesRecentPrerollMonotonically();
-        System.out.println("PASS: All 13 NorthboundSessionTest suites passed.");
+        testV2316CrossCoreKwsDriftInvalidatesStaleConfigStateAndReconciles();
+        System.out.println("PASS: All 14 NorthboundSessionTest suites passed.");
     }
 
     private static void testMiniJsonRoundTrip() {
@@ -1120,6 +1121,124 @@ public final class NorthboundSessionTest {
         s2.handleIncomingLine("{\"type\":\"assistant_state\",\"state\":\"listening\"}");
         assertTrue(tx2.findLastByType("audio_chunk") == null,
                 "full-duplex speaking -> listening MUST NOT flush stale idlePrerollRing blocks");
+    }
+
+    private static void testV2316CrossCoreKwsDriftInvalidatesStaleConfigStateAndReconciles() throws Exception {
+        java.io.File workDir = java.nio.file.Files.createTempDirectory("hm-kws-drift-test").toFile();
+        try {
+            LocalKwsEngine sharedEngine = new LocalKwsEngine(
+                    workDir, null, "android-drift", new LocalKwsEngine.EventListener() {
+                        @Override public void onKwsStateChanged(String state, String detail) {}
+                        @Override public void onKwsReady(double threshold, double score, String loadedHash) {}
+                        @Override public void onKeywordDetected(LocalKwsEngine.KwsEvent event, boolean isRetreat) {}
+                        @Override public void onVadSpeechChanged(boolean speech) {}
+                    });
+
+            String lx06Kw = "n ǐ h ǎo g āo d á @你好高达\nt uì x ià @退下\n";
+            String dot2Kw = "n ǐ h ǎo x iǎo zh ì @你好小智\nt uì x ià @退下\n";
+            String lx06Hash = NorthboundSession.fnv1a64Hex(lx06Kw);
+            String dot2Hash = NorthboundSession.fnv1a64Hex(dot2Kw);
+
+            // 1. Connect to Core A (LX06, block_generation=951, 你好高达) and persist its config_v2_state
+            MockTransport txA1 = new MockTransport();
+            NorthboundSession coreA1 = new NorthboundSession(
+                    "android-drift", "Phone", NorthboundSession.GATEWAY_VERSION, "boot-drift",
+                    txA1, new NorthboundSession.BaseListener());
+            coreA1.attachLocalKwsEngine(sharedEngine);
+            coreA1.handleIncomingLine("{\"type\":\"config_apply\",\"device\":\"android-drift\",\"core_node_id\":\"lx06\","
+                    + "\"data_epoch\":0,\"application_id\":\"app-lx-1\",\"operation_id\":\"op-lx-951\","
+                    + "\"desired_revision\":95,\"block_generation\":951,\"block\":\"kws\",\"schema_version\":1,"
+                    + "\"block_hash\":\"hash-lx06-kws\",\"values\":{\"keywords\":" + MiniJson.stringify(lx06Kw)
+                    + ",\"retreat_words\":[\"退下\"],\"threshold\":0.22,\"score\":3.0}}");
+            assertEquals("active", MiniJson.getString(txA1.findLastByType("config_receipt"), "status", ""));
+            assertEquals(lx06Hash, sharedEngine.getCurrentKeywordsHash());
+            String persistedLx06 = coreA1.exportPersistedConfigStateJson();
+
+            // 2. Switch to Core B (dot2-d, block_generation=1181, 你好小智) — overwrites shared kw.txt on disk!
+            MockTransport txB = new MockTransport();
+            NorthboundSession coreB = new NorthboundSession(
+                    "android-drift", "Phone", NorthboundSession.GATEWAY_VERSION, "boot-drift",
+                    txB, new NorthboundSession.BaseListener());
+            coreB.attachLocalKwsEngine(sharedEngine);
+            coreB.handleIncomingLine("{\"type\":\"config_apply\",\"device\":\"android-drift\",\"core_node_id\":\"dot2-d\","
+                    + "\"data_epoch\":0,\"application_id\":\"app-d2-1\",\"operation_id\":\"op-d2-1181\","
+                    + "\"desired_revision\":118,\"block_generation\":1181,\"block\":\"kws\",\"schema_version\":1,"
+                    + "\"block_hash\":\"hash-dot2-kws\",\"values\":{\"keywords\":" + MiniJson.stringify(dot2Kw)
+                    + ",\"retreat_words\":[\"退下\"],\"threshold\":0.22,\"score\":3.0}}");
+            assertEquals("active", MiniJson.getString(txB.findLastByType("config_receipt"), "status", ""));
+            assertEquals(dot2Hash, sharedEngine.getCurrentKeywordsHash());
+
+            // 3. Switch BACK to Core A (LX06): restore LX06's persisted state, attach shared engine (which still has dot2's kw.txt!)
+            MockTransport txA2 = new MockTransport();
+            NorthboundSession coreA2 = new NorthboundSession(
+                    "android-drift", "Phone", NorthboundSession.GATEWAY_VERSION, "boot-drift",
+                    txA2, new NorthboundSession.BaseListener());
+            assertTrue(coreA2.restorePersistedConfigStateJson(persistedLx06), "restorePersistedConfigStateJson must succeed");
+            coreA2.attachLocalKwsEngine(sharedEngine);
+
+            // config_state MUST report kws as idle with empty active_hash so LX06 never skips reconcile!
+            coreA2.sendConfigState("req-reconcile");
+            Map<String, Object> stateFrame = txA2.findLastByType("config_state");
+            assertNotNull(stateFrame, "config_state must be emitted");
+            List<Object> blocks = MiniJson.getArray(stateFrame, "blocks");
+            Map<String, Object> kwsState = null;
+            for (Object bObj : blocks) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> b = (Map<String, Object>) bObj;
+                if ("kws".equals(MiniJson.getString(b, "block", ""))) {
+                    kwsState = b;
+                    break;
+                }
+            }
+            assertNotNull(kwsState, "kws block must exist in config_state");
+            assertEquals("idle", MiniJson.getString(kwsState, "state", ""));
+            assertEquals("", MiniJson.getString(kwsState, "active_hash", "nonempty"));
+            assertEquals("", MiniJson.getString(kwsState, "persisted_hash", "nonempty"));
+            assertEquals(951L, MiniJson.getLong(kwsState, "block_generation", 0L));
+
+            // kws_report must truthfully report dot2's on-disk hash prior to reconcile
+            coreA2.sendKwsReport("running", "ready");
+            assertEquals(dot2Hash, MiniJson.getString(txA2.findLastByType("kws_report"), "loaded_hash", ""));
+
+            // 4. Core A (LX06) now reconciles with clamped equal generation (951 == 951) -> writes 你好高达 back to disk!
+            coreA2.handleIncomingLine("{\"type\":\"config_apply\",\"device\":\"android-drift\",\"core_node_id\":\"lx06\","
+                    + "\"data_epoch\":0,\"application_id\":\"app-lx-2\",\"operation_id\":\"op-lx-951-reconcile\","
+                    + "\"desired_revision\":95,\"block_generation\":951,\"block\":\"kws\",\"schema_version\":1,"
+                    + "\"block_hash\":\"hash-lx06-kws\",\"values\":{\"keywords\":" + MiniJson.stringify(lx06Kw)
+                    + ",\"retreat_words\":[\"退下\"],\"threshold\":0.22,\"score\":3.0}}");
+            assertEquals("active", MiniJson.getString(txA2.findLastByType("config_receipt"), "status", ""));
+            assertEquals(lx06Hash, sharedEngine.getCurrentKeywordsHash());
+
+            // 5. Same-Core reconnect (no drift!) MUST truthfully report state=active and matching active_hash
+            MockTransport txA3 = new MockTransport();
+            NorthboundSession coreA3 = new NorthboundSession(
+                    "android-drift", "Phone", NorthboundSession.GATEWAY_VERSION, "boot-drift",
+                    txA3, new NorthboundSession.BaseListener());
+            assertTrue(coreA3.restorePersistedConfigStateJson(coreA2.exportPersistedConfigStateJson()), "restore must succeed");
+            coreA3.attachLocalKwsEngine(sharedEngine);
+            coreA3.sendConfigState("req-same-core");
+            List<Object> blocksSame = MiniJson.getArray(txA3.findLastByType("config_state"), "blocks");
+            Map<String, Object> kwsSame = null;
+            for (Object bObj : blocksSame) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> b = (Map<String, Object>) bObj;
+                if ("kws".equals(MiniJson.getString(b, "block", ""))) {
+                    kwsSame = b;
+                    break;
+                }
+            }
+            assertNotNull(kwsSame, "kws block must exist on same-Core reconnect");
+            assertEquals("active", MiniJson.getString(kwsSame, "state", ""));
+            assertEquals("hash-lx06-kws", MiniJson.getString(kwsSame, "active_hash", ""));
+        } finally {
+            java.io.File[] children = workDir.listFiles();
+            if (children != null) {
+                for (java.io.File f : children) {
+                    f.delete();
+                }
+            }
+            workDir.delete();
+        }
     }
 
     private static byte[] makeSinePcm(int samples, double freqHz, int amplitude) {
