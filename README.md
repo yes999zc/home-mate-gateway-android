@@ -69,6 +69,8 @@ This repository is the **Universal Adaptive Android Client & Voice Gateway** in 
 
 All three variants share the exact same UI, protocol logic, and signing certificate (you can upgrade across variants in place without losing configuration). They differ only in whether the offline Sherpa-ONNX JNI wake-word engine is bundled:
 
+> **Production Signing Key (`v2.3.18+`)**: Starting with `v2.3.18`, official Releases are signed with our dedicated 4096-bit RSA release certificate (`CN=Home Mate, O=Home Mate, C=US`, SHA-256: `CC:84:23:73:F1:63:D3:69:76:9B:21:59:D7:AD:CC:EC:0C:0E:86:96:B6:9C:E8:B8:77:8F:8D:83:AC:AF:81:B7`). If you are upgrading from `<= v2.3.17`, please **uninstall the older APK once** before installing `v2.3.18+` (all subsequent updates upgrade in place seamlessly).
+
 | Variant | Size | Bundled Native Engine | Best For |
 | :--- | :--- | :--- | :--- |
 | **`full-arm64`** | **~13 MB** | `arm64-v8a` `libsherpa-onnx-jni.so` + WenetSpeech Zipformer int8 KWS model | **Modern 64-bit Android phones & tablets (Recommended)** — full hands-free offline wake word, smallest full package |
