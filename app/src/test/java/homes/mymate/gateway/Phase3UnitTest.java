@@ -771,8 +771,8 @@ public final class Phase3UnitTest {
         // 1. P0-1: UDP beacon ignores spoofed JSON "host" and rejects non-private/non-Tailscale sender IP
         String spoofBeacon = "{\"type\":\"home_mate_beacon\",\"host\":\"evil.attacker.com\",\"web_port\":8930,\"gateway_port\":8932,\"core_id\":\"hmcore_real\"}";
         homes.mymate.gateway.protocol.CoreDiscovery.DiscoveredCore lanParsed =
-                homes.mymate.gateway.protocol.CoreDiscovery.parseUdpBeacon(spoofBeacon, "192.168.1.73", 4L);
-        assertTrue(lanParsed != null && "192.168.1.73".equals(lanParsed.host),
+                homes.mymate.gateway.protocol.CoreDiscovery.parseUdpBeacon(spoofBeacon, "192.168.10.73", 4L);
+        assertTrue(lanParsed != null && "192.168.10.73".equals(lanParsed.host),
                 "parseUdpBeacon must bind to senderHost and ignore untrusted JSON host");
         homes.mymate.gateway.protocol.CoreDiscovery.DiscoveredCore pubRejected =
                 homes.mymate.gateway.protocol.CoreDiscovery.parseUdpBeacon(spoofBeacon, "8.8.8.8", 4L);

@@ -22,7 +22,19 @@ import urllib.request
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-CORE_REPO = ROOT_DIR.parent / "home mate b"
+
+
+def resolve_core_repo() -> Path:
+    env_override = os.environ.get("HM_CORE_REPO") or os.environ.get("CORE_REPO")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    for candidate in (ROOT_DIR.parent / "home-mate", ROOT_DIR.parent / "home mate b"):
+        if candidate.is_dir():
+            return candidate.resolve()
+    return (ROOT_DIR.parent / "home-mate").resolve()
+
+
+CORE_REPO = resolve_core_repo()
 
 
 def pick_free_port() -> int:
