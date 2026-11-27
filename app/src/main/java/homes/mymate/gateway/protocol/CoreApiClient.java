@@ -1939,6 +1939,7 @@ public final class CoreApiClient {
             conn = isPrivateOrTailscaleHost(host)
                     ? (HttpURLConnection) url.openConnection(Proxy.NO_PROXY)
                     : (HttpURLConnection) url.openConnection();
+            conn.setInstanceFollowRedirects(false);
             conn.setRequestMethod("POST");
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(30_000);
@@ -2282,6 +2283,7 @@ public final class CoreApiClient {
         HttpURLConnection conn = isPrivateOrTailscaleHost(host)
                 ? (HttpURLConnection) url.openConnection(Proxy.NO_PROXY)
                 : (HttpURLConnection) url.openConnection();
+        conn.setInstanceFollowRedirects(false);
         try {
             conn.setRequestMethod(method);
             conn.setConnectTimeout(timeoutMs);

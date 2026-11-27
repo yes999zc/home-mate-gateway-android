@@ -289,8 +289,16 @@ done < <(find "$CLASSES_DIR" -name "*.class" -print0)
   --output "$DEX_DIR" \
   "${CLASS_FILES[@]}"
 
-echo "[4/6] Packaging classes.dex & signing slim APK..."
+echo "[4/6] Packaging classes.dex, legal notices & signing slim APK..."
 (cd "$DEX_DIR" && zip -q "$UNSIGNED_APK" classes.dex)
+NOTICE_STAGE="$BUILD_DIR/intermediates/notice_stage"
+rm -rf "$NOTICE_STAGE" && mkdir -p "$NOTICE_STAGE/assets"
+for nf in LICENSE LICENSE-PROTOCOL-APACHE-2.0 LICENSING.md THIRD_PARTY_NOTICES.md; do
+  if [[ -f "$ROOT_DIR/$nf" ]]; then
+    cp "$ROOT_DIR/$nf" "$NOTICE_STAGE/assets/$nf"
+  fi
+done
+(cd "$NOTICE_STAGE" && zip -q -r "$UNSIGNED_APK" assets)
 "$ZIPALIGN" "${ZIPALIGN_FLAGS[@]}" "$UNSIGNED_APK" "$ALIGNED_APK"
 
 "$APKSIGNER" sign \
