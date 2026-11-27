@@ -48,15 +48,14 @@ public final class LocalKwsEngine {
     public static final String MODE_ASR_HYBRID = "ASR_HYBRID";
 
     public static final List<String> DEFAULT_RETREAT_WORDS = Arrays.asList(
-            "退下", "退下吧", "退一下吧", "停止播放", "滚一边儿去");
+            "退下", "退下吧", "退一下吧", "停止播放");
 
     public static final String DEFAULT_KEYWORDS_TXT =
-            "n ǐ h ǎo x iǎo zh ì @你好小智\n"
+            "n ǐ h ǎo g āo d á @你好高达\n"
             + "z àn t íng b ō f àng @暂停播放\n"
             + "j ì x ù b ō f àng @继续播放\n"
             + "x ià y ì sh ǒu @下一首\n"
             + "t íng zh ǐ b ō f àng @停止播放\n"
-            + "g ǔn y ì b iān ér q ù @滚一边儿去\n"
             + "t uì x ià @退下\n"
             + "t uì x ià b a @退下吧\n"
             + "t uì y í x ià b a @退一下吧\n";

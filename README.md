@@ -84,7 +84,7 @@ All three variants share the exact same UI, protocol logic, and signing certific
 | **Phones & Foldables (including spare old phones)** | Android 8 ~ 16 | Bottom 4-tab layout (Voice / Rooms / Console / Settings), 3D nebula orb, hands-free offline KWS + mid-playback barge-in |
 | **Android Smart Displays & Tablets** | Android 7 ~ 16 | Landscape left navigation rail, OLED StandBy bedside clock, live conversation ticker & whole-house media control |
 | **4-Inch 86 Wall Control Panels (`1:1`)** | Android 6 ~ 11 | Square compact adaptive layout + opt-in **Kiosk Home Launcher** mode |
-| **Screenless Android Speakers (e.g. Phicomm R1)** | Android 5.0 (API 21)+ | Foreground keep-alive service, battery optimization management & continuous far-field voice gateway |
+| **Screenless Android Speakers (e.g. Phicomm R1)** | Android 5.0 (API 21)+ | Foreground keep-alive service, battery optimization management & continuous far-field voice gateway *(install `universal` via `adb install -r hm.apk` and pair over `scrcpy` or ADB input)* |
 
 ---
 

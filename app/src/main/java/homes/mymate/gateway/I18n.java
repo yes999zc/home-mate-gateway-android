@@ -59,7 +59,7 @@ public final class I18n {
         put("history_empty", "暂无对话记录", "No messages yet");
         put("history_subtitle_fmt", "%s · %d 条记录", "%s · %d messages");
         put("history_refreshing", "%s · 正在刷新...", "%s · Refreshing...");
-        put("history_empty_sub", "说「你好小智」唤醒，或在首页输入指令即可开始对话", "Say \"Ni Hao Xiao Zhi\" or type a message on the Voice tab to start");
+        put("history_empty_sub", "说「你好高达」唤醒，或在首页输入指令即可开始对话", "Say \"Hey Mate\" / \"Ni Hao Gao Da\" or type a message on the Voice tab to start");
         put("history_refresh", "刷新", "Refresh");
         put("history_earlier_session", "更早对话", "Earlier conversation");
         put("history_current_session", "当前对话", "Current conversation");
@@ -69,7 +69,7 @@ public final class I18n {
         put("history_clear_btn", "清空", "Clear");
         put("history_cleared", "已清空对话记录", "Conversation history cleared");
         put("history_clear_failed", "清空对话失败", "Failed to clear conversation");
-        put("dialogue_ticker_hint", "说“你好小智”开始对话", "Say \"Ni Hao Xiao Zhi\" to begin");
+        put("dialogue_ticker_hint", "说“你好高达”开始对话", "Say \"Hey Mate\" or tap to begin");
         put("dialogue_tap_more", "查看全部", "History");
 
         // Voice stage
@@ -93,7 +93,7 @@ public final class I18n {
         put("quick_pause_cmd", "暂停播放", "Pause playback");
         put("quick_joke", "讲个笑话", "Tell a Joke");
         put("quick_joke_cmd", "讲个笑话", "Tell me a short joke");
-        put("transcript_empty", "说出 “你好小智” 或轻触上方星云球开始对话", "Say \"Ni Hao Xiao Zhi\" or tap the particle orb to begin");
+        put("transcript_empty", "说出 “你好高达” 或轻触上方星云球开始对话", "Say \"Hey Mate\" / \"Ni Hao Gao Da\" or tap the particle orb to begin");
         put("role_user", "我", "You");
         put("role_assistant", "Home Mate", "Home Mate");
 
@@ -113,7 +113,7 @@ public final class I18n {
         put("rooms_token_btn", "配置令牌", "Set Token");
         put("rooms_enter_token_btn", "输入配对令牌", "Enter Token");
         put("rooms_token_title", "配置房间配对令牌", "Configure Room Bearer Token");
-        put("rooms_token_desc", "可在对应 Core 控制台的「设置 → 安全与令牌」中复制配对令牌", "Copy the Bearer token from Core Console → Settings → Security & Token");
+        put("rooms_token_desc", "请输入首次配对 Core 时保存的 Bearer 令牌（如已忘记，可在 Core 控制台「设置 → 安全与令牌」点击轮换生成新令牌）", "Enter the Bearer token saved during Core pairing (if lost, rotate a new one in Core Console → Settings → Security & Token)");
         put("rooms_token_verify_btn", "验证并配对", "Verify & Pair");
         put("rooms_token_verifying", "正在验证令牌...", "Verifying token...");
         put("rooms_token_verified_ok", "配对成功", "Paired successfully");
