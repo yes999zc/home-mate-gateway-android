@@ -464,6 +464,33 @@ public final class CoreApiClientTest {
                     ex.close();
                 }
             });
+            server.createContext("/repos/yes999zc/rate-limited/releases/latest", new HttpHandler() {
+                @Override
+                public void handle(HttpExchange ex) throws IOException {
+                    byte[] resp = "{\"message\":\"API rate limit exceeded\"}".getBytes(StandardCharsets.UTF_8);
+                    ex.sendResponseHeaders(403, resp.length);
+                    ex.getResponseBody().write(resp);
+                    ex.close();
+                }
+            });
+            server.createContext("/yes999zc/rate-limited/releases/latest", new HttpHandler() {
+                @Override
+                public void handle(HttpExchange ex) throws IOException {
+                    ex.getResponseHeaders().add("Location",
+                            "https://github.com/yes999zc/rate-limited/releases/tag/v2.3.19");
+                    ex.sendResponseHeaders(302, -1);
+                    ex.close();
+                }
+            });
+            server.createContext("/yes999zc/no-release-web/releases/latest", new HttpHandler() {
+                @Override
+                public void handle(HttpExchange ex) throws IOException {
+                    ex.getResponseHeaders().add("Location",
+                            "https://github.com/yes999zc/no-release-web/releases");
+                    ex.sendResponseHeaders(302, -1);
+                    ex.close();
+                }
+            });
             server.createContext("/apk/version.json", new HttpHandler() {
                 @Override
                 public void handle(HttpExchange ex) throws IOException {
@@ -555,7 +582,48 @@ public final class CoreApiClientTest {
             assertTrue(!badApiScheme.available && badApiScheme.error != null,
                     "Non-http(s) GitHub API URL must be rejected cleanly");
 
-            // 9. Empty expected_session_id rejected when includeArchived=false, permitted when includeArchived=true
+            // 9. GitHub API HTTP 403 rate-limit automatically falls back to rate-limit-free 302 redirect
+            assertTrue(
+                    "https://github.com/yes999zc/home-mate-gateway-android/releases/latest".equals(
+                            ReleaseUpdater.deriveWebReleasesLatestUrl(ReleaseUpdater.DEFAULT_GITHUB_RELEASES_API)),
+                    "deriveWebReleasesLatestUrl must map api.github.com to github.com");
+            assertTrue("v2.3.19".equals(ReleaseUpdater.parseTagFromRedirectLocation(
+                    "https://github.com/yes999zc/home-mate-gateway-android/releases/tag/v2.3.19")),
+                    "parseTagFromRedirectLocation must extract tag");
+            ReleaseUpdater.UpdateResult rlArm64 = ReleaseUpdater.checkSync(
+                    446, "2.3.16",
+                    "http://127.0.0.1:" + port + "/repos/yes999zc/rate-limited/releases/latest",
+                    true);
+            assertTrue(rlArm64.available && rlArm64.error == null && !rlArm64.noReleaseYet,
+                    "403 rate-limit must seamlessly fall back to 302 redirect, got err=" + rlArm64.error);
+            assertTrue("2.3.19".equals(rlArm64.latestVersionName),
+                    "403 fallback expected 2.3.19, got: " + rlArm64.latestVersionName);
+            assertTrue(rlArm64.downloadUrl.endsWith("/releases/download/v2.3.19/HomeMate-Gateway-v2.3.19-full-arm64.apk"),
+                    "403 fallback arm64 URL mismatch: " + rlArm64.downloadUrl);
+
+            ReleaseUpdater.UpdateResult rlUniv = ReleaseUpdater.checkSync(
+                    446, "2.3.16",
+                    "http://127.0.0.1:" + port + "/repos/yes999zc/rate-limited/releases/latest",
+                    false);
+            assertTrue(rlUniv.available && rlUniv.error == null
+                            && rlUniv.downloadUrl.endsWith("/releases/download/v2.3.19/HomeMate-Gateway-v2.3.19-universal.apk"),
+                    "403 fallback universal URL mismatch: " + rlUniv.downloadUrl);
+
+            // Direct web /releases/latest URL works directly (without REST API) and handles no-release redirect
+            ReleaseUpdater.UpdateResult directWeb = ReleaseUpdater.checkSync(
+                    449, "2.3.19",
+                    "http://127.0.0.1:" + port + "/yes999zc/rate-limited/releases/latest",
+                    true);
+            assertTrue(!directWeb.available && directWeb.error == null && !directWeb.noReleaseYet,
+                    "Direct web redirect equal version must report up-to-date");
+            ReleaseUpdater.UpdateResult emptyWeb = ReleaseUpdater.checkSync(
+                    446, "2.3.16",
+                    "http://127.0.0.1:" + port + "/yes999zc/no-release-web/releases/latest",
+                    true);
+            assertTrue(!emptyWeb.available && emptyWeb.noReleaseYet && emptyWeb.error == null,
+                    "Web redirect to /releases without /tag/ must report noReleaseYet=true");
+
+            // 10. Empty expected_session_id rejected when includeArchived=false, permitted when includeArchived=true
             CoreApiClient.ActionOutcome emptyRejected = CoreApiClient.clearDeviceConversation(
                     "127.0.0.1", port, "android-fold", "", false, "Bearer hm1_valid_token");
             assertTrue(!emptyRejected.ok && emptyRejected.httpCode == 0,

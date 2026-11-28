@@ -19,6 +19,9 @@ public final class ReleaseUpdater {
 
     public static final String DEFAULT_GITHUB_RELEASES_API =
             "https://api.github.com/repos/yes999zc/home-mate-gateway-android/releases/latest";
+    public static final String DEFAULT_GITHUB_RELEASES_WEB =
+            "https://github.com/yes999zc/home-mate-gateway-android/releases/latest";
+    private static final int GITHUB_TIMEOUT_MS = 8000;
 
     public static final class UpdateResult {
         public final boolean available;
@@ -74,6 +77,66 @@ public final class ReleaseUpdater {
         return lower.contains("/releases/latest") || lower.contains("api.github.com/repos/");
     }
 
+    public static boolean isGitHubWebReleasesUrl(String url) {
+        if (url == null) {
+            return false;
+        }
+        String lower = url.trim().toLowerCase(Locale.US);
+        return lower.contains("/releases/latest") && !lower.contains("/repos/");
+    }
+
+    /**
+     * Converts a GitHub REST Releases API URL
+     * ({@code https://api.github.com/repos/<owner>/<repo>/releases/latest} or a local test mirror
+     * {@code http://host/repos/<owner>/<repo>/releases/latest}) into its rate-limit-free web
+     * redirect URL ({@code https://github.com/<owner>/<repo>/releases/latest}).
+     */
+    public static String deriveWebReleasesLatestUrl(String apiUrl) {
+        if (apiUrl == null) {
+            return "";
+        }
+        String trimmed = apiUrl.trim();
+        if (!isHttpUrl(trimmed)) {
+            return "";
+        }
+        String lower = trimmed.toLowerCase(Locale.US);
+        if (lower.startsWith("https://api.github.com/repos/")) {
+            return "https://github.com/" + trimmed.substring("https://api.github.com/repos/".length());
+        }
+        if (lower.startsWith("http://api.github.com/repos/")) {
+            return "https://github.com/" + trimmed.substring("http://api.github.com/repos/".length());
+        }
+        int reposIdx = lower.indexOf("/repos/");
+        if (reposIdx > 0 && lower.contains("/releases/latest")) {
+            return trimmed.substring(0, reposIdx) + "/" + trimmed.substring(reposIdx + "/repos/".length());
+        }
+        return "";
+    }
+
+    /**
+     * Extracts the release tag from a GitHub {@code /releases/latest} 302 {@code Location} header
+     * (e.g. {@code .../releases/tag/v2.3.19} -> {@code v2.3.19}). Returns empty string if no tag.
+     */
+    public static String parseTagFromRedirectLocation(String location) {
+        if (location == null) {
+            return "";
+        }
+        String trimmed = location.trim();
+        String lower = trimmed.toLowerCase(Locale.US);
+        int tagIdx = lower.indexOf("/releases/tag/");
+        if (tagIdx < 0) {
+            return "";
+        }
+        String tag = trimmed.substring(tagIdx + "/releases/tag/".length());
+        int q = tag.indexOf('?');
+        if (q >= 0) tag = tag.substring(0, q);
+        int h = tag.indexOf('#');
+        if (h >= 0) tag = tag.substring(0, h);
+        int slash = tag.indexOf('/');
+        if (slash >= 0) tag = tag.substring(0, slash);
+        return tag.trim();
+    }
+
     private static UpdateResult checkGitHubRelease(
             int currentVersionCode,
             String currentVersionName,
@@ -83,14 +146,18 @@ public final class ReleaseUpdater {
             return new UpdateResult(false, false, currentVersionCode, currentVersionCode,
                     "", "", "", "Invalid update URL scheme");
         }
+        if (isGitHubWebReleasesUrl(apiUrl)) {
+            return checkGitHubWebRedirect(currentVersionCode, currentVersionName, apiUrl, preferArm64);
+        }
         HttpURLConnection conn = null;
+        String apiError = null;
         try {
             URL url = new URL(apiUrl);
             conn = (HttpURLConnection) (CoreApiClient.isPrivateOrTailscaleHost(url.getHost())
                     ? url.openConnection(Proxy.NO_PROXY)
                     : url.openConnection());
-            conn.setConnectTimeout(4500);
-            conn.setReadTimeout(4500);
+            conn.setConnectTimeout(GITHUB_TIMEOUT_MS);
+            conn.setReadTimeout(GITHUB_TIMEOUT_MS);
             conn.setRequestProperty("Accept", "application/vnd.github+json");
             conn.setRequestProperty("User-Agent", "HomeMate-Gateway-Android/"
                     + (currentVersionName != null ? currentVersionName : "2.0.0"));
@@ -99,12 +166,96 @@ public final class ReleaseUpdater {
                 return new UpdateResult(false, true, currentVersionCode, currentVersionCode,
                         "", "", "", null);
             }
-            if (code != 200) {
-                return new UpdateResult(false, false, currentVersionCode, currentVersionCode,
-                        "", "", "", "HTTP " + code);
+            if (code == 200) {
+                String body = readResponseBody(conn);
+                return parseGitHubReleaseJson(body, currentVersionCode, currentVersionName, preferArm64);
             }
-            String body = readResponseBody(conn);
-            return parseGitHubReleaseJson(body, currentVersionCode, currentVersionName, preferArm64);
+            apiError = "HTTP " + code;
+        } catch (Throwable t) {
+            apiError = t.getMessage() != null ? t.getMessage() : "network error";
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+        // GitHub REST API enforces a strict 60 req/hr unauthenticated limit per exit IP
+        // (commonly returning HTTP 403/429 on mobile CGNAT/VPN/proxy IPs). Fall back to
+        // the rate-limit-free web `/releases/latest` 302 redirect whenever the API fails.
+        String webUrl = deriveWebReleasesLatestUrl(apiUrl);
+        if (!webUrl.isEmpty()) {
+            UpdateResult fallback = checkGitHubWebRedirect(
+                    currentVersionCode, currentVersionName, webUrl, preferArm64);
+            if (fallback.error == null) {
+                return fallback;
+            }
+        }
+        return new UpdateResult(false, false, currentVersionCode, currentVersionCode,
+                "", "", "", apiError);
+    }
+
+    private static UpdateResult checkGitHubWebRedirect(
+            int currentVersionCode,
+            String currentVersionName,
+            String webLatestUrl,
+            boolean preferArm64) {
+        if (!isHttpUrl(webLatestUrl)) {
+            return new UpdateResult(false, false, currentVersionCode, currentVersionCode,
+                    "", "", "", "Invalid update URL scheme");
+        }
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(webLatestUrl);
+            conn = (HttpURLConnection) (CoreApiClient.isPrivateOrTailscaleHost(url.getHost())
+                    ? url.openConnection(Proxy.NO_PROXY)
+                    : url.openConnection());
+            conn.setInstanceFollowRedirects(false);
+            conn.setRequestMethod("HEAD");
+            conn.setConnectTimeout(GITHUB_TIMEOUT_MS);
+            conn.setReadTimeout(GITHUB_TIMEOUT_MS);
+            conn.setRequestProperty("User-Agent", "HomeMate-Gateway-Android/"
+                    + (currentVersionName != null ? currentVersionName : "2.0.0"));
+            int code = conn.getResponseCode();
+            if (code == 404) {
+                return new UpdateResult(false, true, currentVersionCode, currentVersionCode,
+                        "", "", "", null);
+            }
+            if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                String loc = conn.getHeaderField("Location");
+                String tag = parseTagFromRedirectLocation(loc);
+                if (tag.isEmpty()) {
+                    // GitHub redirects `/releases/latest` to `/releases` when no release exists.
+                    if (loc != null && loc.toLowerCase(Locale.US).endsWith("/releases")) {
+                        return new UpdateResult(false, true, currentVersionCode, currentVersionCode,
+                                "", "", "", null);
+                    }
+                    return new UpdateResult(false, false, currentVersionCode, currentVersionCode,
+                            "", "", "", "Unexpected redirect location");
+                }
+                String latestName = stripVersionPrefix(tag);
+                String repoBase = webLatestUrl.trim();
+                int relIdx = repoBase.toLowerCase(Locale.US).indexOf("/releases/latest");
+                if (relIdx > 0) {
+                    repoBase = repoBase.substring(0, relIdx);
+                }
+                String apkName = preferArm64
+                        ? ("HomeMate-Gateway-" + tag + "-full-arm64.apk")
+                        : ("HomeMate-Gateway-" + tag + "-universal.apk");
+                String downloadUrl = repoBase + "/releases/download/" + tag + "/" + apkName;
+                boolean newer = !latestName.isEmpty()
+                        && compareSemver(latestName, stripVersionPrefix(currentVersionName)) > 0
+                        && isHttpUrl(downloadUrl);
+                return new UpdateResult(
+                        newer,
+                        false,
+                        currentVersionCode,
+                        newer ? currentVersionCode + 1 : currentVersionCode,
+                        latestName,
+                        downloadUrl,
+                        "GitHub Release " + tag,
+                        null);
+            }
+            return new UpdateResult(false, false, currentVersionCode, currentVersionCode,
+                    "", "", "", "HTTP " + code);
         } catch (Throwable t) {
             return new UpdateResult(false, false, currentVersionCode, currentVersionCode,
                     "", "", "", t.getMessage() != null ? t.getMessage() : "network error");
